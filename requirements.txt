@@ -1,0 +1,11 @@
+altgraph==0.17.4
+gitdb==4.0.12
+GitPython==3.1.45
+packaging==25.0
+pefile==2023.2.7
+pillow==11.3.0
+pyinstaller==6.15.0
+pyinstaller-hooks-contrib==2025.8
+pywin32-ctypes==0.2.3
+setuptools==80.9.0
+smmap==5.0.2
