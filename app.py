@@ -219,6 +219,9 @@ def clone_repo():
     threading.Thread(target=task, daemon=True).start()
 
 def list_branches(repo_path=None):
+    """
+    Populate branch dropdown with **local** branches only (avoids duplicates with origin/*).
+    """
     global repo, branch_var, branch_dropdown
 
     repo_path = repo_path or clone_dir_entry.get()
@@ -231,52 +234,38 @@ def list_branches(repo_path=None):
 
         # Fetch safely if 'origin' exists
         try:
-            if repo.remotes:
-                if any(r.name == "origin" for r in repo.remotes):
-                    repo.remotes.origin.fetch()
+            if repo.remotes and any(r.name == "origin" for r in repo.remotes):
+                repo.remotes.origin.fetch()
         except Exception:
             pass
 
-        # Collect local + remote branch names
+        # Local branches only for switching
         local_branches = [str(b) for b in getattr(repo, "branches", [])]
-        remote_branches = []
-        try:
-            if any(r.name == "origin" for r in repo.remotes):
-                remote_branches = [
-                    str(r).replace("origin/", "")
-                    for r in repo.remotes.origin.refs
-                    if "HEAD" not in r.name
-                ]
-        except Exception:
-            pass
-
-        all_branches = sorted(set(local_branches + remote_branches))
+        all_branches = sorted(set(local_branches))
         if not all_branches:
-            messagebox.showwarning("Branches", "No branches found in this repository.")
+            messagebox.showwarning("Branches", "No local branches found in this repository.")
             return
 
         # Determine current branch (handle detached HEAD)
         try:
             current_branch = str(repo.active_branch)
         except Exception:
-            current_branch = None
+            current_branch = all_branches[0]
 
         if current_branch not in all_branches:
-            current_branch = all_branches[0]
+            all_branches.insert(0, current_branch)
 
         branch_var.set(current_branch)
         current_branch_label.config(text=f"Current branch: {current_branch}")
 
-        # Rebuild the dropdown with an explicit default
+        # Rebuild the dropdown (choices only; no injected first item)
         if branch_dropdown is not None:
             branch_dropdown.destroy()
 
-        # IMPORTANT: pass a default *and* the remaining values
         branch_dropdown = tk.OptionMenu(
             branch_section,
             branch_var,
-            current_branch,         # default value (prevents the error)
-            *all_branches           # the choices
+            *all_branches
         )
         branch_dropdown.grid(row=3, column=1, padx=10, pady=5, sticky="w")
 
@@ -291,7 +280,6 @@ def list_branches(repo_path=None):
 
     except Exception as e:
         messagebox.showerror("Error", f"Failed to list branches:\n{e}")
-
 
 def switch_branch():
     global repo
@@ -324,7 +312,8 @@ def git_fetch_status():
         messagebox.showwarning("Error", "No repository loaded.")
         return
     try:
-        repo.remotes.origin.fetch()
+        if repo.remotes and any(r.name == "origin" for r in repo.remotes):
+            repo.remotes.origin.fetch()
         status = repo.git.status()
         messagebox.showinfo("Git Status", status)
     except Exception as e:
@@ -337,8 +326,12 @@ def git_log_branch():
         return
     branch_name = branch_var.get()
     try:
-        log = repo.git.log(f"origin/{branch_name}", oneline=True)
-        messagebox.showinfo(f"Git Log - {branch_name}", log or "No new commits.")
+        # Prefer local; fall back to origin/branch if exists
+        try:
+            log = repo.git.log(branch_name, '--oneline')
+        except Exception:
+            log = repo.git.log(f"origin/{branch_name}", '--oneline')
+        messagebox.showinfo(f"Git Log - {branch_name}", log or "No commits found.")
     except Exception as e:
         messagebox.showerror("Error", f"Git log failed:\n{e}")
 
@@ -371,14 +364,33 @@ def clear_selected_files():
     file_entries.clear()
 
 def choose_files():
-    global selected_files, file_entries
-    files = filedialog.askopenfilenames(initialdir=clone_dir_entry.get())
+    """Allow choosing files only from inside the repo working dir."""
+    global selected_files, file_entries, repo
+    if not repo:
+        messagebox.showwarning("Error", "Load a repository first.")
+        return
+    files = filedialog.askopenfilenames(initialdir=repo.working_dir)
     if files:
-        add_all_checkbox.grid_remove()
+        added_any = False
+        repo_root = os.path.abspath(repo.working_dir)
         for f in files:
-            if f not in selected_files:
-                selected_files.append(f)
-                add_file_entry(f)
+            absf = os.path.abspath(f)
+            # Ensure file is inside repo
+            try:
+                if os.path.commonpath([repo_root, absf]) != repo_root:
+                    messagebox.showwarning("Skip", f"{os.path.basename(f)} is outside this repository.")
+                    continue
+            except Exception:
+                pass
+            if absf not in selected_files:
+                selected_files.append(absf)
+                add_file_entry(absf)
+                added_any = True
+        if added_any:
+            add_all_checkbox.grid_remove()
+        else:
+            # nothing valid was added, keep the checkbox visible
+            add_all_checkbox.grid(row=0, column=0, sticky="w", padx=5, pady=(0, 5))
 
 def add_file_entry(f):
     global file_entries
@@ -429,6 +441,7 @@ def commit_changes():
 
     try:
         if add_all_var.get():
+            # One commit for everything staged
             msg = commit_msg_entry.get().strip()
             if not msg:
                 messagebox.showwarning("Error", "Please enter a commit message for all files.")
@@ -444,22 +457,41 @@ def commit_changes():
             committed_files = [(os.path.basename(p), msg) for p in staged]
 
         else:
+            # One commit per selected file (with its own message)
             if not selected_files:
                 messagebox.showwarning("Error", "No files selected.")
                 return
 
+            # Ensure every selected file has a message
             for f in selected_files:
                 per_msg = file_entries[f][1].get().strip()
                 if not per_msg:
                     messagebox.showwarning("Error", f"Please enter a commit message for {os.path.basename(f)}")
                     return
 
-            repo.git.add(selected_files)
-
+            # Commit each file separately
             for f in selected_files:
                 per_msg = file_entries[f][1].get().strip()
+
+                try:
+                    rel = os.path.relpath(f, repo.working_dir)
+                except Exception:
+                    rel = f
+
+                # Only commit if there are changes for this file (staged or unstaged)
+                has_changes = repo.git.status("--porcelain", "--", rel).strip()
+                if not has_changes:
+                    # no changes for this file; skip
+                    continue
+
+                # stage and commit just this file
+                repo.git.add("--", rel)
                 repo.index.commit(per_msg)
                 committed_files.append((os.path.basename(f), per_msg))
+
+            if not committed_files:
+                messagebox.showinfo("Nothing to commit", "No changes detected for the selected files.")
+                return
 
         show_commit_summary(committed_files)
 
@@ -516,7 +548,6 @@ def _guess_merge_from_into(repo, merge_commit):
         into_name = decorations.split("HEAD ->")[1].split(",")[0].strip()
 
     return (from_name, into_name)
-
 
 def refresh_workflow_graph():
     global repo
@@ -604,8 +635,6 @@ def resource_path(rel_path: str) -> str:
     return os.path.join(base, rel_path)
 
 # --- Window icon ---
-# .py run: load the .ico from project folder (if present).
-# .exe run: the icon comes from PyInstaller's --icon flag; failure is ignored.
 try:
     root.iconbitmap(resource_path("insightsnet_logo.ico"))
 except Exception:
@@ -825,7 +854,6 @@ tk.Label(
     pady=20
 ).pack()
 
-# ---- Git AuthN Tab (NEW)
 # ---- Git AuthN Tab (Redesigned) ----
 auth_wrap = tk.LabelFrame(auth_tab, text="Authentication", padx=20, pady=20, font=("Arial", 12, "bold"))
 auth_wrap.pack(fill="both", expand=True, padx=20, pady=20)
