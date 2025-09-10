@@ -159,6 +159,14 @@ def _prefill_auth_fields():
 
 # =============== Repo / Branch / Commit logic ===============
 
+def _has_remote_origin() -> bool:
+    """Return True if repo has a remote named 'origin'."""
+    global repo
+    try:
+        return repo is not None and any(r.name == "origin" for r in repo.remotes)
+    except Exception:
+        return False
+
 def browse_folder():
     folder = filedialog.askdirectory()
     if folder:
@@ -219,9 +227,7 @@ def clone_repo():
     threading.Thread(target=task, daemon=True).start()
 
 def list_branches(repo_path=None):
-    """
-    Populate branch dropdown with **local** branches only (avoids duplicates with origin/*).
-    """
+    """Populate branch dropdown with local + remote (origin) branches."""
     global repo, branch_var, branch_dropdown
 
     repo_path = repo_path or clone_dir_entry.get()
@@ -232,48 +238,56 @@ def list_branches(repo_path=None):
     try:
         repo = Repo(repo_path)
 
-        # Fetch safely if 'origin' exists
+        # Make sure we have all remote heads locally
         try:
-            if repo.remotes and any(r.name == "origin" for r in repo.remotes):
-                repo.remotes.origin.fetch()
+            if _has_remote_origin():
+                repo.git.fetch("--all", "--prune")
         except Exception:
             pass
 
-        # Local branches only for switching
-        local_branches = [str(b) for b in getattr(repo, "branches", [])]
-        all_branches = sorted(set(local_branches))
-        if not all_branches:
-            messagebox.showwarning("Branches", "No local branches found in this repository.")
+        # Local branches
+        local = {str(h) for h in getattr(repo, "branches", [])}
+
+        # Remote branches under origin (strip the 'origin/' prefix)
+        remote = set()
+        try:
+            if _has_remote_origin():
+                for rf in repo.remotes.origin.refs:
+                    n = getattr(rf, "remote_head", None) or (rf.name.split("/", 1)[1] if "/" in rf.name else rf.name)
+                    if n and n != "HEAD":
+                        remote.add(n)
+        except Exception:
+            pass
+
+        # Union of local + remote names
+        all_names = sorted(local | remote)
+        if not all_names:
+            messagebox.showwarning("Branches", "No branches found (local or remote).")
             return
 
-        # Determine current branch (handle detached HEAD)
+        # Determine current branch (may be detached)
         try:
             current_branch = str(repo.active_branch)
         except Exception:
-            current_branch = all_branches[0]
+            current_branch = "main" if "main" in all_names else all_names[0]
 
-        if current_branch not in all_branches:
-            all_branches.insert(0, current_branch)
+        if current_branch not in all_names:
+            all_names.insert(0, current_branch)
 
         branch_var.set(current_branch)
         current_branch_label.config(text=f"Current branch: {current_branch}")
 
-        # Rebuild the dropdown (choices only; no injected first item)
         if branch_dropdown is not None:
             branch_dropdown.destroy()
 
-        branch_dropdown = tk.OptionMenu(
-            branch_section,
-            branch_var,
-            *all_branches
-        )
+        branch_dropdown = tk.OptionMenu(branch_section, branch_var, *all_names)
         branch_dropdown.grid(row=3, column=1, padx=10, pady=5, sticky="w")
 
-        # When selection changes, switch branch
         def _on_branch_change(*_):
             switch_branch()
+
         try:
-            branch_var.trace_remove("write", branch_var._trace_id)  # cleanup old trace if present
+            branch_var.trace_remove("write", getattr(branch_var, "_trace_id", None))
         except Exception:
             pass
         branch_var._trace_id = branch_var.trace_add("write", _on_branch_change)
@@ -282,13 +296,33 @@ def list_branches(repo_path=None):
         messagebox.showerror("Error", f"Failed to list branches:\n{e}")
 
 def switch_branch():
+    """Checkout local branch, or create tracking branch from origin/<name> if missing."""
     global repo
-    target_branch = branch_var.get()
+    target = branch_var.get().strip()
+    if not target:
+        return
     try:
-        repo.git.checkout(target_branch)
-        current_branch_label.config(text=f"Current branch: {target_branch}")
+        local_names = {str(h) for h in getattr(repo, "branches", [])}
+
+        if target in local_names:
+            # Simple checkout
+            repo.git.checkout(target)
+        else:
+            # Create local branch tracking origin/<target>
+            if _has_remote_origin():
+                remote_full = f"origin/{target}"
+                remote_heads = [r.name for r in repo.remotes.origin.refs]
+                if remote_full in remote_heads:
+                    repo.git.checkout("-b", target, "--track", remote_full)
+                else:
+                    raise Exception(f"Remote branch '{remote_full}' not found.")
+            else:
+                raise Exception("No 'origin' remote; cannot create tracking branch.")
+
+        current_branch_label.config(text=f"Current branch: {target}")
         file_frame.grid()
         _prefill_auth_fields()
+
     except Exception as e:
         messagebox.showerror("Error", f"Failed to switch branch:\n{e}")
 
@@ -510,9 +544,23 @@ def show_commit_summary(committed_files):
 
 def push_changes(popup, committed_files):
     global repo
-    branch_name = branch_var.get()
+    branch_name = branch_var.get().strip()
+    if not branch_name:
+        messagebox.showwarning("Error", "No branch selected.")
+        return
     try:
-        repo.git.push("origin", branch_name)
+        # First push needs upstream; subsequent pushes don't.
+        tracking = None
+        try:
+            tracking = repo.active_branch.tracking_branch()
+        except Exception:
+            tracking = None
+
+        if tracking is None or str(tracking) == "":
+            repo.git.push("--set-upstream", "origin", branch_name)
+        else:
+            repo.git.push("origin", branch_name)
+
         popup.destroy()
         messagebox.showinfo("Success", f"Pushed {len(committed_files)} file(s) to {branch_name}")
     except Exception as e:
@@ -648,8 +696,8 @@ notebook = ttk.Notebook(root)
 main_tab  = ttk.Frame(notebook)
 graph_tab = ttk.Frame(notebook)
 about_tab = ttk.Frame(notebook)
-auth_tab  = ttk.Frame(notebook)   # NEW
-notebook.add(auth_tab,  text="Git AuthN")      # NEW
+auth_tab  = ttk.Frame(notebook)
+notebook.add(auth_tab,  text="Git AuthN")
 notebook.add(main_tab,  text="Main")
 notebook.add(graph_tab, text="Workflow Graph")
 notebook.add(about_tab, text="About")
@@ -810,7 +858,7 @@ except Exception:
     pass
 
 def smart_pdf_name():
-    base = "igrm_User_Guide"
+    base = "User_Guide_insightsnet-git-repo-management"
     ver = "v0.9"
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
     repo_name = ""
@@ -854,11 +902,10 @@ tk.Label(
     pady=20
 ).pack()
 
-# ---- Git AuthN Tab (Redesigned) ----
+# ---- Git AuthN Tab (UI) ----
 auth_wrap = tk.LabelFrame(auth_tab, text="Authentication", padx=20, pady=20, font=("Arial", 12, "bold"))
 auth_wrap.pack(fill="both", expand=True, padx=20, pady=20)
 
-# Logo (top center)
 try:
     auth_logo_img = Image.open(resource_path("insightsnet_logo.png")).resize((120, 120))
     auth_logo_photo = ImageTk.PhotoImage(auth_logo_img)
@@ -868,41 +915,21 @@ try:
 except Exception:
     pass
 
-# Welcome text
-tk.Label(
-    auth_wrap,
-    text="Welcome to InsightsNet GitRepo Manager",
-    font=("Arial", 14, "bold")
-).pack(pady=(0, 10))
-
-# Subtitle
-tk.Label(
-    auth_wrap,
-    text="Configure your GitLab/GitHub author identity",
-    font=("Arial", 11),
-).pack(pady=(0, 15))
-
-# Show Effective Identity button
+tk.Label(auth_wrap, text="Welcome to InsightsNet GitRepo Manager", font=("Arial", 14, "bold")).pack(pady=(0, 10))
+tk.Label(auth_wrap, text="Configure your GitLab/GitHub author identity", font=("Arial", 11)).pack(pady=(0, 15))
 tk.Button(auth_wrap, text="Show Git Identity", command=_show_effective_identity).pack(pady=(0, 15))
 
-# Name + Email entries (centered)
-name_frame = tk.Frame(auth_wrap)
-name_frame.pack(pady=5)
+name_frame = tk.Frame(auth_wrap); name_frame.pack(pady=5)
 tk.Label(name_frame, text="Name:", width=8, anchor="e").grid(row=0, column=0, padx=5)
 auth_name_var = tk.StringVar()
-auth_name_entry = tk.Entry(name_frame, textvariable=auth_name_var, width=35)
-auth_name_entry.grid(row=0, column=1)
+auth_name_entry = tk.Entry(name_frame, textvariable=auth_name_var, width=35); auth_name_entry.grid(row=0, column=1)
 
-email_frame = tk.Frame(auth_wrap)
-email_frame.pack(pady=5)
+email_frame = tk.Frame(auth_wrap); email_frame.pack(pady=5)
 tk.Label(email_frame, text="Email:", width=8, anchor="e").grid(row=0, column=0, padx=5)
 auth_email_var = tk.StringVar()
-auth_email_entry = tk.Entry(email_frame, textvariable=auth_email_var, width=35)
-auth_email_entry.grid(row=0, column=1)
+auth_email_entry = tk.Entry(email_frame, textvariable=auth_email_var, width=35); auth_email_entry.grid(row=0, column=1)
 
-# Apply buttons (side by side, centered)
-apply_frame = tk.Frame(auth_wrap)
-apply_frame.pack(pady=20)
+apply_frame = tk.Frame(auth_wrap); apply_frame.pack(pady=20)
 tk.Button(apply_frame, text="Apply Loaded Repository", command=_apply_identity_repo, width=20).grid(row=0, column=0, padx=20)
 tk.Button(apply_frame, text="Apply Globally", command=_apply_identity_global, width=18).grid(row=0, column=1, padx=20)
 
