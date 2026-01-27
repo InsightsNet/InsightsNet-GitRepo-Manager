@@ -706,12 +706,29 @@ def git_pull_branch():
 
 # =============== Commit Section ===============
 
+def _set_commit_msg_visibility(show: bool):
+    """Show/hide the single commit message row."""
+    if show:
+        commit_msg_label.grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        commit_msg_entry.grid(row=2, column=1, columnspan=2, padx=5, pady=5)
+    else:
+        commit_msg_label.grid_remove()
+        commit_msg_entry.grid_remove()
+
+def _refresh_commit_msg_visibility():
+    """Hide the 'all files' message if selecting specific files."""
+    if add_all_var.get():
+        _set_commit_msg_visibility(True)
+        return
+    _set_commit_msg_visibility(False if selected_files else True)
+
 def toggle_add_all():
     if add_all_var.get():
         choose_button.grid_remove()
         clear_selected_files()
     else:
         choose_button.grid(row=0, column=1, padx=5, pady=(0, 5))
+    _refresh_commit_msg_visibility()
 
 def clear_selected_files():
     global selected_files, file_entries
@@ -719,6 +736,7 @@ def clear_selected_files():
     for widget in file_messages_frame.winfo_children():
         widget.destroy()
     file_entries.clear()
+    _refresh_commit_msg_visibility()
 
 def choose_files():
     """Allow choosing files only from inside the repo working dir."""
@@ -746,6 +764,7 @@ def choose_files():
             add_all_checkbox.grid_remove()
         else:
             add_all_checkbox.grid(row=0, column=0, sticky="w", padx=5, pady=(0, 5))
+        _refresh_commit_msg_visibility()
 
 def add_file_entry(f):
     global file_entries
@@ -775,6 +794,7 @@ def remove_file(f):
 
     if not selected_files:
         add_all_checkbox.grid(row=0, column=0, sticky="w", padx=5, pady=(0, 5))
+    _refresh_commit_msg_visibility()
 
 def refresh_file_entries():
     for idx, f in enumerate(list(file_entries.keys())):
@@ -826,12 +846,13 @@ def commit_changes():
                     rel = os.path.relpath(f, repo.working_dir)
                 except Exception:
                     rel = f
+                rel_git = rel.replace("\\", "/")
 
-                has_changes = repo.git.status("--porcelain", "--", rel).strip()
+                has_changes = repo.git.status("--porcelain", "--", rel_git).strip()
                 if not has_changes:
                     continue
 
-                repo.git.add("--", rel)
+                repo.git.add("--", rel_git)
                 repo.index.commit(per_msg)
                 committed_files.append((os.path.basename(f), per_msg))
 
@@ -1145,14 +1166,14 @@ def show_graph_help():
 
 # =============== UI ===============
 
-root = tk.Tk()
-root.title("InsightsNet GitRepo Manager")
-
 # Taskbar grouping on Windows (safe no-op elsewhere)
 try:
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("InsightsNet.GitRepoManager")
 except Exception:
     pass
+
+root = tk.Tk()
+root.title("InsightsNet GitRepo Manager")
 
 def resource_path(rel_path: str) -> str:
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -1161,6 +1182,11 @@ def resource_path(rel_path: str) -> str:
 # Window icon
 try:
     root.iconbitmap(resource_path("insightsnet_logo.ico"))
+except Exception:
+    pass
+try:
+    _icon_img = ImageTk.PhotoImage(Image.open(resource_path("insightsnet_logo.png")))
+    root.iconphoto(True, _icon_img)
 except Exception:
     pass
 
@@ -1268,11 +1294,13 @@ file_frame.grid(row=1, column=0, columnspan=3, padx=10, pady=(0, 10), sticky="we
 file_messages_frame = tk.Frame(file_frame)
 file_messages_frame.pack(fill="both", expand=True)
 
-tk.Label(commit_section, text="Commit message (for all files):").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+commit_msg_label = tk.Label(commit_section, text="Commit message (for all files):")
+commit_msg_label.grid(row=2, column=0, sticky="w", padx=5, pady=5)
 commit_msg_entry = tk.Entry(commit_section, width=55)
 commit_msg_entry.grid(row=2, column=1, columnspan=2, padx=5, pady=5)
 tk.Button(commit_section, text="Commit Changes", command=commit_changes)\
   .grid(row=3, column=0, columnspan=3, pady=10)
+_refresh_commit_msg_visibility()
 
 # ---- Workflow Graph Tab
 graph_top = tk.Frame(graph_tab)
