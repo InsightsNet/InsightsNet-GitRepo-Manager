@@ -704,6 +704,25 @@ def git_pull_branch():
     except Exception as e:
         messagebox.showerror("Error", f"Git pull failed:\n{e}")
 
+def git_push():
+    global repo
+    if not repo:
+        messagebox.showwarning("Error", "No repository loaded.")
+        return
+    r = _get_primary_remote()
+    if not r:
+        messagebox.showwarning("Error", "No remote configured.")
+        return
+    branch_name = _current_branch_name() or branch_var.get().strip()
+    if not branch_name:
+        messagebox.showwarning("Error", "No branch selected.")
+        return
+    try:
+        out = repo.git.push(r.name, branch_name)
+        messagebox.showinfo("Git Push", out or f"Pushed {branch_name} to '{r.name}'.")
+    except Exception as e:
+        messagebox.showerror("Git Push", f"Git push failed:\n{e}")
+
 # =============== Commit Section ===============
 
 def _set_commit_msg_visibility(show: bool):
@@ -1301,6 +1320,18 @@ commit_msg_entry.grid(row=2, column=1, columnspan=2, padx=5, pady=5)
 tk.Button(commit_section, text="Commit Changes", command=commit_changes)\
   .grid(row=3, column=0, columnspan=3, pady=10)
 _refresh_commit_msg_visibility()
+
+push_section = tk.LabelFrame(scrollable_frame, text="Push to Remote Repository",
+                             padx=10, pady=10, relief="groove", font=("Arial", 12, "bold"))
+push_section.grid(row=3, column=0, columnspan=3, padx=10, pady=10, sticky="we")
+
+tk.Label(
+    push_section,
+    text="Use manual push if your local branch is ahead or the commit section didn't push.",
+    font=("Arial", 10)
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+tk.Button(push_section, text="Git Push", command=git_push).grid(row=1, column=0, padx=5, pady=5)
 
 # ---- Workflow Graph Tab
 graph_top = tk.Frame(graph_tab)
