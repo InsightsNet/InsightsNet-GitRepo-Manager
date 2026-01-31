@@ -1433,7 +1433,7 @@ except Exception:
 
 def smart_pdf_name():
     base = "igrm_User_Guide"
-    ver = "v0.15"
+    ver = "v0.17"
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
     repo_name = ""
     try:
@@ -1471,7 +1471,7 @@ tk.Label(
 tk.Button(about_tab, text="Download User Guide (PDF)", command=download_pdf).pack(pady=10)
 tk.Label(
     about_tab,
-    text="-----------------------------------------\nInsightsNet GitRepo Manager\nVersion 0.15\nDeveloped by Team InsightsNet\n© 2026",
+    text="-----------------------------------------\nInsightsNet GitRepo Manager\nVersion 0.17\nDeveloped by Team InsightsNet\n© 2026",
     font=("Arial", 12),
     pady=20
 ).pack()
