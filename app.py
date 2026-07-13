@@ -11,6 +11,8 @@ import ctypes
 import threading
 import datetime
 import re
+import textwrap
+import queue
 from urllib.parse import urlparse
 from git import Repo
 
@@ -18,6 +20,54 @@ repo = None
 branch_dropdown = None
 selected_files = []
 file_entries = {}
+app_closing = False
+graph_refresh_in_progress = False
+_PUSH_SECTION_GRID = {"row": 3, "column": 0, "columnspan": 3, "padx": 10, "pady": 10, "sticky": "we"}
+_ui_queue = queue.Queue()
+
+def _post_ui(fn):
+    """Enqueue a UI callback to run on the Tk main thread."""
+    _ui_queue.put(fn)
+
+# ---- Tk cleanup guard to avoid noisy shutdown warnings ----
+try:
+    if not hasattr(ImageTk.PhotoImage, "_orig_del"):
+        ImageTk.PhotoImage._orig_del = ImageTk.PhotoImage.__del__
+        def _safe_photoimage_del(self):
+            try:
+                ImageTk.PhotoImage._orig_del(self)
+            except RuntimeError:
+                # Happens on shutdown when Tk mainloop is gone
+                pass
+        ImageTk.PhotoImage.__del__ = _safe_photoimage_del
+except Exception:
+    pass
+
+try:
+    if not hasattr(tk.Image, "_orig_del"):
+        tk.Image._orig_del = tk.Image.__del__
+        def _safe_image_del(self):
+            try:
+                tk.Image._orig_del(self)
+            except RuntimeError:
+                # Happens on shutdown when Tk mainloop is gone
+                pass
+        tk.Image.__del__ = _safe_image_del
+except Exception:
+    pass
+
+try:
+    if not hasattr(tk.Variable, "_orig_del"):
+        tk.Variable._orig_del = tk.Variable.__del__
+        def _safe_variable_del(self):
+            try:
+                tk.Variable._orig_del(self)
+            except RuntimeError:
+                # Happens on shutdown when Tk mainloop is gone
+                pass
+        tk.Variable.__del__ = _safe_variable_del
+except Exception:
+    pass
 
 # =============== Git AuthN helpers ===============
 
@@ -330,14 +380,49 @@ def _parse_ssh_user_host(url: str):
 
 def _ask_yes_no(title: str, msg: str) -> bool:
     """Thread-safe yes/no prompt."""
+    if app_closing or not root.winfo_exists():
+        return False
+    if threading.current_thread() is threading.main_thread():
+        return messagebox.askyesno(title, msg)
     result = {"value": False}
     done = threading.Event()
     def _prompt():
         result["value"] = messagebox.askyesno(title, msg)
         done.set()
-    root.after(0, _prompt)
+    _post_ui(_prompt)
     done.wait()
     return result["value"]
+
+def _set_status(_msg: str):
+    """No-op: status popup removed."""
+    return
+
+def _ensure_gitignore(repo_path: str) -> bool:
+    """Ensure a .gitignore exists in repo_path and includes .venv."""
+    try:
+        if not repo_path:
+            return False
+        gitignore_path = os.path.join(repo_path, ".gitignore")
+        if not os.path.exists(gitignore_path):
+            with open(gitignore_path, "w", encoding="utf-8") as f:
+                f.write(".venv\n")
+            return True
+
+        try:
+            with open(gitignore_path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except UnicodeDecodeError:
+            with open(gitignore_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.read().splitlines()
+
+        if ".venv" not in lines:
+            with open(gitignore_path, "a", encoding="utf-8") as f:
+                if lines and lines[-1] != "":
+                    f.write("\n")
+                f.write(".venv\n")
+        return True
+    except Exception:
+        return False
 
 def _extract_ssh_fingerprint(msg: str) -> str:
     """Extract SHA256 fingerprint from ssh output if present."""
@@ -483,6 +568,7 @@ def clone_repo():
             # Case 1: Load existing repo directly from base_dir if no repo_url
             if not repo_url and os.path.isdir(base_dir) and os.path.isdir(os.path.join(base_dir, ".git")):
                 repo = Repo(base_dir)
+                _ensure_gitignore(repo.working_dir)
                 result["ok"] = True
                 result["kind"] = "loaded_direct"
                 result["path"] = base_dir
@@ -499,6 +585,7 @@ def clone_repo():
                 # Case 2: Repo already cloned at full_clone_path
                 if os.path.isdir(full_clone_path) and os.path.isdir(os.path.join(full_clone_path, ".git")):
                     repo = Repo(full_clone_path)
+                    _ensure_gitignore(repo.working_dir)
                     result["ok"] = True
                     result["kind"] = "loaded_existing_clone"
                     result["path"] = full_clone_path
@@ -508,6 +595,7 @@ def clone_repo():
                         if not _ensure_ssh_host_trusted(repo_url):
                             raise Exception("SSH host key not trusted; clone canceled.")
                     repo = Repo.clone_from(repo_url, full_clone_path)
+                    _ensure_gitignore(repo.working_dir)
                     result["ok"] = True
                     result["kind"] = "cloned"
                     result["path"] = full_clone_path
@@ -516,6 +604,8 @@ def clone_repo():
             result["error"] = e
 
         def ui_update():
+            if app_closing or not root.winfo_exists():
+                return
             download_button.config(state=tk.NORMAL)
             if not result["ok"]:
                 messagebox.showerror("Error", f"Failed to clone/load repo:\n{result['error']}")
@@ -532,13 +622,18 @@ def clone_repo():
                 title = "Success"
                 msg = f"Repository cloned to:\n{path}"
 
+            _reset_commit_ui(clear_add_all=True, hide_push=True)
+            _clear_workflow_ui()
             messagebox.showinfo(title, msg)
             list_branches(path)
             _prefill_auth_fields()
+            _update_terminal_prompt()
+            refresh_workflow_graph()
 
-        root.after(0, ui_update)
+        _post_ui(ui_update)
 
-    threading.Thread(target=task, daemon=True).start()
+    # Run synchronously to avoid Tk thread issues during repo switching.
+    task()
 
 def list_branches(repo_path=None):
     """Populate branch dropdown with local + remote branches (any remote)."""
@@ -611,6 +706,7 @@ def list_branches(repo_path=None):
 
     except Exception as e:
         messagebox.showerror("Error", f"Failed to list branches:\n{e}")
+    _update_terminal_prompt()
 
 def switch_branch():
     """Checkout local branch, or create tracking branch from <remote>/<name> if missing."""
@@ -755,6 +851,14 @@ def clear_selected_files():
     for widget in file_messages_frame.winfo_children():
         widget.destroy()
     file_entries.clear()
+    try:
+        if add_all_var.get():
+            choose_button.grid_remove()
+        else:
+            add_all_checkbox.grid(row=0, column=0, sticky="w", padx=5, pady=(0, 5))
+            choose_button.grid(row=0, column=1, padx=5, pady=(0, 5))
+    except Exception:
+        pass
     _refresh_commit_msg_visibility()
 
 def choose_files():
@@ -822,6 +926,364 @@ def refresh_file_entries():
         entry.grid(row=idx * 2 + 1, column=0, padx=10, pady=(0, 10))
         btn.grid(row=idx * 2, column=1, padx=5)
 
+def _show_push_section():
+    try:
+        if 'push_section' in globals() and push_section is not None:
+            push_section.grid(**_PUSH_SECTION_GRID)
+    except Exception:
+        pass
+
+def _hide_push_section():
+    try:
+        if 'push_section' in globals() and push_section is not None:
+            push_section.grid_remove()
+    except Exception:
+        pass
+
+def _clear_workflow_ui():
+    try:
+        ascii_text.config(state="normal")
+        ascii_text.delete("1.0", "end")
+        ascii_text.insert("1.0", "No repository loaded.\n")
+        ascii_text.config(state="disabled")
+    except Exception:
+        pass
+
+    try:
+        for table in (merges_table, commits_table):
+            for row in table.get_children():
+                table.delete(row)
+    except Exception:
+        pass
+
+def _reset_commit_ui(clear_add_all: bool = False, hide_push: bool = True):
+    try:
+        if clear_add_all:
+            add_all_var.set(False)
+    except Exception:
+        pass
+    try:
+        commit_msg_entry.delete(0, "end")
+    except Exception:
+        pass
+    clear_selected_files()
+    if hide_push:
+        _hide_push_section()
+
+def _format_status_lines(status_lines: list[str], limit: int = 15) -> str:
+    if not status_lines:
+        return "(no local changes)"
+    shown = status_lines[:limit]
+    suffix = f"\n...and {len(status_lines) - limit} more" if len(status_lines) > limit else ""
+    return "\n".join(shown) + suffix
+
+def _format_log_lines(log_text: str, limit: int = 10) -> str:
+    lines = [ln for ln in (log_text or "").splitlines() if ln.strip()]
+    if not lines:
+        return "(no remote commits)"
+    shown = lines[:limit]
+    suffix = f"\n...and {len(lines) - limit} more" if len(lines) > limit else ""
+    return "\n".join(shown) + suffix
+
+def _show_pre_commit_summary(remote_summary: str, local_summary: str, final_summary: str) -> bool:
+    popup = Toplevel(root)
+    popup.title("Pre-Commit Sync Check")
+    popup.geometry("780x620")
+    popup.minsize(520, 420)
+    popup.grid_rowconfigure(1, weight=1)
+    popup.grid_columnconfigure(0, weight=1)
+
+    tk.Label(popup, text="Remote vs Local Summary", font=("Arial", 11, "bold"))\
+      .grid(row=0, column=0, sticky="w", padx=10, pady=(10, 6))
+    tk.Label(
+        popup,
+        text="Legend: M = Modified, A = Added (staged new file), ?? = Untracked",
+        font=("Arial", 9),
+        fg="#444444",
+    ).grid(row=0, column=0, sticky="e", padx=10, pady=(10, 6))
+
+    txt = scrolledtext.ScrolledText(popup, wrap="word")
+    txt.grid(row=1, column=0, sticky="nsew", padx=10, pady=0)
+
+    # Color tags for clarity
+    txt.tag_configure("hdr_remote", foreground="#1f5fbf", font=("Arial", 9, "bold"))
+    txt.tag_configure("hdr_local", foreground="#1b7f3a", font=("Arial", 9, "bold"))
+    txt.tag_configure("hdr_final", foreground="#6a3dbf", font=("Arial", 9, "bold"))
+    txt.tag_configure("body_remote", foreground="#0f2f66")
+    txt.tag_configure("body_local", foreground="#0f4a23")
+    txt.tag_configure("body_final", foreground="#3a1c66")
+    txt.tag_configure("rule", foreground="#777777")
+
+    def _ins(header, rule, body, tag_hdr, tag_body):
+        txt.insert("end", header + "\n", tag_hdr)
+        txt.insert("end", rule + "\n", "rule")
+        txt.insert("end", body + "\n\n", tag_body)
+
+    _ins(
+        "REMOTE (incoming changes)",
+        "-------------------------",
+        remote_summary,
+        "hdr_remote",
+        "body_remote",
+    )
+    _ins(
+        "LOCAL (your working changes)",
+        "-----------------------------",
+        local_summary,
+        "hdr_local",
+        "body_local",
+    )
+    _ins(
+        "FINAL (after stash + pull + reapply)",
+        "-------------------------------------",
+        final_summary,
+        "hdr_final",
+        "body_final",
+    )
+    txt.configure(state="disabled")
+
+    btns = tk.Frame(popup)
+    btns.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
+    btns.grid_columnconfigure(0, weight=1)
+    btns.grid_columnconfigure(1, weight=1)
+    btns.grid_columnconfigure(2, weight=1)
+
+    result = {"ok": False}
+
+    def _preview_final_diff():
+        try:
+            popup.grab_release()
+        except Exception:
+            pass
+        _show_final_diff_popup(parent=popup)
+        try:
+            popup.grab_set()
+        except Exception:
+            pass
+
+    def _ok():
+        result["ok"] = True
+        popup.destroy()
+
+    def _cancel():
+        result["ok"] = False
+        popup.destroy()
+
+    tk.Button(btns, text="Preview Final Diff", command=_preview_final_diff)\
+      .grid(row=0, column=0, sticky="e", padx=5)
+    tk.Button(btns, text="OK (Stash, Pull, Reapply)", command=_ok)\
+      .grid(row=0, column=1, sticky="e", padx=5)
+    tk.Button(btns, text="Cancel", command=_cancel)\
+      .grid(row=0, column=2, sticky="w", padx=5)
+
+    popup.grab_set()
+    root.wait_window(popup)
+    return result["ok"]
+
+def _open_simple_diff_window(title: str, subtitle: str, diff_text: str, parent=None):
+    popup = Toplevel(parent or root)
+    popup.title(title)
+    popup.geometry("1100x700")
+    popup.minsize(700, 420)
+    if parent:
+        try:
+            popup.transient(parent)
+        except Exception:
+            pass
+
+    popup.grid_rowconfigure(1, weight=1)
+    popup.grid_columnconfigure(0, weight=1)
+
+    tk.Label(popup, text=title, font=("Arial", 11, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 2))
+    if subtitle:
+        tk.Label(popup, text=subtitle, font=("Arial", 9)).grid(row=0, column=0, sticky="e", padx=10, pady=(10, 2))
+
+    txt = scrolledtext.ScrolledText(popup, wrap="none")
+    txt.grid(row=1, column=0, sticky="nsew", padx=10, pady=0)
+    hbar = tk.Scrollbar(popup, orient="horizontal", command=txt.xview)
+    hbar.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+    txt.configure(xscrollcommand=hbar.set)
+
+    _colorize_diff_text(txt, diff_text or "(no changes)")
+    txt.configure(state="disabled")
+    try:
+        popup.grab_set()
+    except Exception:
+        pass
+    popup.wait_window(popup)
+
+def _show_final_diff_popup(parent=None):
+    global repo
+    if not repo:
+        messagebox.showwarning("Error", "No repository loaded.")
+        return
+    r = _get_primary_remote()
+    if not r:
+        messagebox.showwarning("Error", "No remote configured.")
+        return
+
+    branch_name = _current_branch_name() or branch_var.get().strip()
+    if not branch_name:
+        messagebox.showwarning("Error", "No branch selected.")
+        return
+
+    tracking = None
+    try:
+        tracking = repo.active_branch.tracking_branch()
+    except Exception:
+        tracking = None
+
+    upstream = str(tracking) if tracking else f"{r.name}/{branch_name}"
+
+    def _diff_no_index(old_path: str, new_path: str) -> str:
+        """Return git diff for no-index; accept return codes 0/1."""
+        cmd = ["git", "diff", "--no-index", "--binary", "--", old_path, new_path]
+        res = subprocess.run(cmd, cwd=repo.working_dir, capture_output=True, text=True)
+        if res.returncode in (0, 1):
+            return res.stdout
+        raise RuntimeError((res.stderr or res.stdout or "").strip() or "git diff --no-index failed")
+
+    def _diff_untracked_file(rel_path: str) -> str:
+        # Try OS null device first; fall back to /dev/null for Git behavior.
+        for null_path in (os.devnull, "/dev/null"):
+            try:
+                return _diff_no_index(null_path, rel_path)
+            except Exception:
+                continue
+        return ""
+
+    try:
+        # Diff working tree against upstream (final view after pull+reapply).
+        diff_parts = []
+        diff_base = repo.git.diff(upstream)
+        if diff_base.strip():
+            diff_parts.append(diff_base)
+
+        # Include untracked files so "?? file" appears in preview.
+        for rel in (repo.untracked_files or []):
+            abs_path = os.path.join(repo.working_dir, rel)
+            if not os.path.isfile(abs_path):
+                continue
+            ut_diff = _diff_untracked_file(rel)
+            if ut_diff.strip():
+                diff_parts.append(ut_diff)
+
+        diff_text = "\n".join(diff_parts).strip()
+    except Exception as e:
+        messagebox.showerror("Preview failed", f"Could not generate diff:\n{e}")
+        return
+
+    subtitle = f"Diff: working tree vs {upstream}"
+    _open_simple_diff_window("Preview Final Diff", subtitle, diff_text, parent=parent)
+
+def _pre_commit_sync_if_needed() -> bool:
+    """If remote is ahead and local has changes, show summary and auto stash/pull/pop."""
+    global repo
+    try:
+        r = _get_primary_remote()
+        if not repo or not r:
+            return True
+
+        branch_name = _current_branch_name() or branch_var.get().strip()
+        if not branch_name:
+            return True
+
+        try:
+            r.fetch()
+        except Exception:
+            pass
+
+        tracking = None
+        try:
+            tracking = repo.active_branch.tracking_branch()
+        except Exception:
+            tracking = None
+
+        upstream = str(tracking) if tracking else f"{r.name}/{branch_name}"
+
+        try:
+            counts = repo.git.rev_list("--left-right", "--count", f"{branch_name}...{upstream}").strip()
+            ahead_str, behind_str = (counts.split() + ["0", "0"])[:2]
+            ahead = int(ahead_str)
+            behind = int(behind_str)
+        except Exception:
+            ahead = behind = 0
+
+        dirty = repo.is_dirty(untracked_files=True)
+
+        remote_log = ""
+        try:
+            remote_log = repo.git.log("--oneline", f"{branch_name}..{upstream}")
+        except Exception:
+            remote_log = ""
+
+        status_lines = []
+        try:
+            status_lines = repo.git.status("--porcelain").splitlines()
+        except Exception:
+            status_lines = []
+
+        remote_summary = _format_log_lines(remote_log, limit=12)
+        local_summary = _format_status_lines(status_lines, limit=20)
+        if behind > 0 and dirty:
+            final_summary = (
+                f"Remote is ahead by {behind} commit(s). "
+                "Your local changes will be stashed, pulled, and then reapplied. "
+                "If conflicts happen during reapply, you will need to resolve them before committing."
+            )
+        elif behind > 0:
+            final_summary = (
+                f"Remote is ahead by {behind} commit(s). "
+                "No local changes detected, so only a pull is needed."
+            )
+        elif dirty:
+            final_summary = (
+                "Remote is not ahead. Your local changes will be committed without a pull."
+            )
+        else:
+            final_summary = "No remote changes and no local changes detected."
+
+        if not _show_pre_commit_summary(remote_summary, local_summary, final_summary):
+            return False
+
+        if behind > 0 and dirty:
+            stash_created = False
+            try:
+                out = repo.git.stash("push", "-u", "-m", "autostash: pre-commit")
+                if "No local changes to save" not in (out or ""):
+                    stash_created = True
+            except Exception as e:
+                messagebox.showerror("Stash failed", f"Git stash failed:\n{e}")
+                return False
+
+            try:
+                repo.git.pull(r.name, branch_name)
+            except Exception as e:
+                messagebox.showerror("Pull failed", f"Git pull failed:\n{e}")
+                return False
+
+            if stash_created:
+                try:
+                    repo.git.stash("pop")
+                except Exception as e:
+                    messagebox.showerror(
+                        "Stash apply failed",
+                        f"Git stash pop failed (possible conflicts):\n{e}\n\n"
+                        "Resolve conflicts, then try commit again."
+                    )
+                    return False
+        elif behind > 0 and not dirty:
+            try:
+                repo.git.pull(r.name, branch_name)
+            except Exception as e:
+                messagebox.showerror("Pull failed", f"Git pull failed:\n{e}")
+                return False
+
+        return True
+    except Exception as e:
+        messagebox.showerror("Sync check failed", f"{e}")
+        return False
+
 def commit_changes():
     global repo
     if not repo:
@@ -833,6 +1295,9 @@ def commit_changes():
     committed_files = []
 
     try:
+        if not _pre_commit_sync_if_needed():
+            return
+
         if add_all_var.get():
             msg = commit_msg_entry.get().strip()
             if not msg:
@@ -880,9 +1345,257 @@ def commit_changes():
                 return
 
         show_commit_summary(committed_files)
+        _show_push_section()
+        _reset_commit_ui(clear_add_all=False, hide_push=False)
+        refresh_workflow_graph()
 
     except Exception as e:
         messagebox.showerror("Error", f"Commit failed:\n{e}")
+
+def _normalize_relpath(path: str) -> str:
+    try:
+        rel = os.path.relpath(path, repo.working_dir)
+    except Exception:
+        rel = path
+    return rel.replace("\\", "/")
+
+def _colorize_diff_text(widget: tk.Text, diff_text: str):
+    widget.tag_configure("add", foreground="green")
+    widget.tag_configure("del", foreground="red")
+    widget.tag_configure("ctx", foreground="black")
+
+    if not diff_text:
+        widget.insert("end", "(no changes)", "ctx")
+        return
+
+    for line in diff_text.splitlines(keepends=True):
+        if line.startswith("+") and not line.startswith("+++"):
+            widget.insert("end", line, "add")
+        elif line.startswith("-") and not line.startswith("---"):
+            widget.insert("end", line, "del")
+        else:
+            widget.insert("end", line, "ctx")
+
+def _open_diff_window(title: str, subtitle: str, before_text: str, after_text: str):
+    popup = Toplevel(root)
+    popup.title(title)
+    popup.geometry("1100x700")
+    popup.minsize(700, 420)
+
+    popup.grid_rowconfigure(1, weight=1)
+    popup.grid_columnconfigure(0, weight=1)
+
+    tk.Label(popup, text=title, font=("Arial", 11, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 2))
+    if subtitle:
+        tk.Label(popup, text=subtitle, font=("Arial", 9)).grid(row=0, column=0, sticky="e", padx=10, pady=(10, 2))
+
+    panes = ttk.Panedwindow(popup, orient="horizontal")
+    panes.grid(row=1, column=0, sticky="nsew", padx=10, pady=0)
+
+    left = tk.Frame(panes)
+    right = tk.Frame(panes)
+    panes.add(left, weight=1)
+    panes.add(right, weight=1)
+
+    tk.Label(left, text="Before Commit (unstaged + staged)", font=("Arial", 9, "bold"))\
+      .grid(row=0, column=0, sticky="w", padx=4, pady=(4, 2))
+    tk.Label(right, text="Last Commit (vs parent)", font=("Arial", 9, "bold"))\
+      .grid(row=0, column=0, sticky="w", padx=4, pady=(4, 2))
+
+    for frame, content in ((left, before_text), (right, after_text)):
+        frame.grid_rowconfigure(1, weight=1)
+        frame.grid_columnconfigure(0, weight=1)
+        txt = scrolledtext.ScrolledText(frame, wrap="none")
+        txt.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
+        hbar = tk.Scrollbar(frame, orient="horizontal", command=txt.xview)
+        hbar.grid(row=2, column=0, sticky="ew", padx=4, pady=(0, 4))
+        txt.configure(xscrollcommand=hbar.set)
+        _colorize_diff_text(txt, content)
+        txt.configure(state="disabled")
+
+def _open_diff_tabs_window(title: str, items: list[dict]):
+    """Open a single popup with a tab per file diff."""
+    popup = Toplevel(root)
+    popup.title(title)
+    popup.geometry("1100x700")
+    popup.minsize(700, 420)
+
+    popup.grid_rowconfigure(1, weight=1)
+    popup.grid_columnconfigure(0, weight=1)
+
+    tk.Label(popup, text=title, font=("Arial", 11, "bold")).grid(
+        row=0, column=0, sticky="w", padx=10, pady=(10, 2)
+    )
+
+    notebook = ttk.Notebook(popup)
+    notebook.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+    for item in items:
+        path = item.get("path", "")
+        before_text = item.get("before", "")
+        after_text = item.get("after", "")
+        subtitle = item.get("subtitle", "")
+
+        tab = tk.Frame(notebook)
+        tab.grid_rowconfigure(1, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+
+        if subtitle:
+            tk.Label(tab, text=subtitle, font=("Arial", 9)).grid(
+                row=0, column=0, sticky="w", padx=6, pady=(6, 4)
+            )
+
+        panes = ttk.Panedwindow(tab, orient="horizontal")
+        panes.grid(row=1, column=0, sticky="nsew", padx=4, pady=0)
+
+        left = tk.Frame(panes)
+        right = tk.Frame(panes)
+        panes.add(left, weight=1)
+        panes.add(right, weight=1)
+
+        tk.Label(left, text="Before Commit (unstaged + staged)", font=("Arial", 9, "bold"))\
+          .grid(row=0, column=0, sticky="w", padx=4, pady=(4, 2))
+        tk.Label(right, text="Last Commit (vs parent)", font=("Arial", 9, "bold"))\
+          .grid(row=0, column=0, sticky="w", padx=4, pady=(4, 2))
+
+        for frame, content in ((left, before_text), (right, after_text)):
+            frame.grid_rowconfigure(1, weight=1)
+            frame.grid_columnconfigure(0, weight=1)
+            txt = scrolledtext.ScrolledText(frame, wrap="none")
+            txt.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
+            hbar = tk.Scrollbar(frame, orient="horizontal", command=txt.xview)
+            hbar.grid(row=2, column=0, sticky="ew", padx=4, pady=(0, 4))
+            txt.configure(xscrollcommand=hbar.set)
+            _colorize_diff_text(txt, content)
+            txt.configure(state="disabled")
+
+        tab_title = os.path.basename(path) if path else "File"
+        notebook.add(tab, text=tab_title)
+
+def _collect_changed_files_for_preview():
+    if add_all_var.get():
+        return None  # signal: all changes
+    if selected_files:
+        return [_normalize_relpath(f) for f in selected_files]
+    return []
+
+def _is_preview_allowed(path: str) -> bool:
+    """Return False for binary/office/image formats that should not be previewed."""
+    ext = os.path.splitext(path)[1].lower()
+    blocked = {
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".svg",
+        ".ico",
+        ".pdf",
+        ".doc", ".docx",
+        ".ppt", ".pptx",
+    }
+    return ext not in blocked
+
+def _branch_context_label():
+    local = _current_branch_name() or branch_var.get().strip() or "(detached)"
+    remote = "(no upstream)"
+    try:
+        if repo and repo.active_branch:
+            tracking = repo.active_branch.tracking_branch()
+            if tracking:
+                remote = str(tracking)
+    except Exception:
+        pass
+    return f"Local: {local} | Remote: {remote}"
+
+def preview_changes():
+    """Show per-file diffs: before commit vs last commit."""
+    global repo
+    if not repo:
+        messagebox.showwarning("Error", "No repository loaded.")
+        return
+
+    paths = _collect_changed_files_for_preview()
+    if paths == []:
+        messagebox.showwarning("Error", "No files selected. Choose files or enable 'Add all files'.")
+        return
+
+    try:
+        untracked = set(repo.untracked_files or [])
+        if paths is None:
+            files = repo.git.diff("--name-only").splitlines()
+            files += repo.git.diff("--name-only", "--cached").splitlines()
+            files = sorted({f for f in files if f})
+            files += sorted({f for f in untracked if f})
+            files = sorted({f for f in files if f})
+        else:
+            files = paths
+
+        if not files:
+            messagebox.showinfo("No changes", "No unstaged or staged changes to preview.")
+            return
+
+        files = [f for f in files if _is_preview_allowed(f)]
+        if not files:
+            messagebox.showinfo(
+                "No previewable files",
+                "No previewable files found. Image/PDF/Office/Icon formats are excluded."
+            )
+            return
+
+        preview_items = []
+        for f in files:
+            is_untracked = f in untracked
+            unstaged = repo.git.diff("--", f)
+            staged = repo.git.diff("--cached", "--", f)
+            combined = ""
+            if is_untracked:
+                combined += f"*** NEW FILE (untracked): {f} ***\n"
+                file_abs = os.path.join(repo.working_dir, f)
+                try:
+                    with open(file_abs, "r", encoding="utf-8", errors="replace") as fh:
+                        content = fh.read()
+                    if content:
+                        combined += "diff --git a/{0} b/{0}\n".format(f)
+                        combined += "new file mode 100644\n"
+                        combined += "--- /dev/null\n"
+                        combined += f"+++ b/{f}\n"
+                        for line in content.splitlines():
+                            combined += f"+{line}\n"
+                    else:
+                        combined += "(empty file)\n"
+                except Exception as e:
+                    combined += f"(could not read file: {e})\n"
+            if unstaged:
+                combined += f"--- Unstaged diff for {f} ---\n{unstaged}\n"
+            if staged:
+                combined += f"--- Staged diff for {f} ---\n{staged}\n"
+            if not combined:
+                combined = ""
+
+            after_text = ""
+            try:
+                if repo.head.is_valid():
+                    head = repo.head.commit
+                    if head.parents:
+                        after_text = repo.git.show("--pretty=format:", "HEAD", "--", f)
+                    else:
+                        after_text = repo.git.show("--pretty=format:", "HEAD", "--", f)
+                else:
+                    after_text = "*** No commits yet in this repository ***"
+            except Exception:
+                after_text = ""
+
+            if not after_text:
+                after_text = f"*** Not in last commit: {f} ***"
+
+            subtitle = f"{f}    |    {_branch_context_label()}"
+            preview_items.append({
+                "path": f,
+                "before": combined,
+                "after": after_text,
+                "subtitle": subtitle,
+            })
+
+        if preview_items:
+            _open_diff_tabs_window("Preview Changes", preview_items)
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to preview changes:\n{e}")
 
 def show_commit_summary(committed_files):
     popup = Toplevel(root)
@@ -1006,18 +1719,9 @@ def _branch_hint_for_commit(repo, sha: str) -> str:
     m = re.match(r'([^~^{}]+)', token)
     return m.group(1) if m else token
 
-def refresh_workflow_graph():
-    global repo
-    if not repo:
-        messagebox.showwarning("Error", "No repository loaded.")
-        return
-
+def _collect_workflow_data(r: Repo):
     # --- Build commit list once (for tables + coloring) ---
-    try:
-        commits = list(repo.iter_commits("--all", max_count=300))
-    except Exception as e:
-        messagebox.showerror("Error", f"Failed to read commits:\n{e}")
-        return
+    commits = list(r.iter_commits("--all", max_count=300))
 
     # Classify commits for coloring
     merge_shas = set()
@@ -1036,7 +1740,7 @@ def refresh_workflow_graph():
 
     # Branch tips (local + remote refs)
     try:
-        for ref in repo.refs:
+        for ref in r.refs:
             try:
                 branch_tip_shas.add(ref.commit.hexsha)
             except Exception:
@@ -1067,7 +1771,7 @@ def refresh_workflow_graph():
 
     # --- ASCII graph on the left (WITHOUT date/author) ---
     try:
-        ascii_graph = repo.git.log(
+        ascii_graph = r.git.log(
             "--graph", "--decorate", "--all",
             "--pretty=format:%h %d %s",   # no %ad %an here
             max_count="300"
@@ -1075,14 +1779,62 @@ def refresh_workflow_graph():
     except Exception as e:
         ascii_graph = f"Failed to render git graph: {e}"
 
+    # --- Build Recent Commits rows ---
+    commits_rows = []
+    for c in commits:
+        short_sha = c.hexsha[:8]
+        when = datetime.datetime.fromtimestamp(c.committed_date).strftime("%Y-%m-%d")
+        author = c.author.name if c.author else "Unknown"
+        msg = c.message.splitlines()[0] if (c.message or "").splitlines() else ""
+        branch = _branch_hint_for_commit(r, c.hexsha) or ""
+        try:
+            files_changed = len(c.stats.files or {})
+        except Exception:
+            files_changed = 0
+        commits_rows.append((short_sha, when, author, branch, files_changed, msg))
+
+    # --- Build Merges rows ---
+    try:
+        raw = r.git.log(
+            "--all", "--merges", "--date=short",
+            "--pretty=format:%H%x00%ad%x00%an%x00%s"
+        )
+        merge_lines = [ln for ln in raw.split("\n") if ln] if raw else []
+    except Exception:
+        merge_lines = []
+
+    merges_rows = []
+    for ln in merge_lines:
+        try:
+            sha, ad, au, msg = ln.split("\x00", 3)
+        except ValueError:
+            continue
+        try:
+            mc = r.commit(sha)
+        except Exception:
+            mc = None
+        from_name = into_name = ''
+        if mc and len(mc.parents) >= 2:
+            from_name, into_name = _guess_merge_from_into(r, mc)
+        merges_rows.append((sha[:8], ad, au, from_name, into_name, msg))
+
+    return {
+        "short_kind": short_kind,
+        "ascii_graph": ascii_graph,
+        "commits_rows": commits_rows,
+        "merges_rows": merges_rows,
+    }
+
+def _apply_workflow_data(data: dict):
+    short_kind = data.get("short_kind", {})
+    ascii_graph = data.get("ascii_graph", "")
+    commits_rows = data.get("commits_rows", [])
+    merges_rows = data.get("merges_rows", [])
+
     ascii_text.config(state="normal")
     ascii_text.delete("1.0", "end")
 
-    if ascii_graph:
-        lines = ascii_graph.splitlines()
-    else:
-        lines = []
-
+    lines = ascii_graph.splitlines() if ascii_graph else []
     for line in lines:
         start = ascii_text.index("end-1c")
         ascii_text.insert("end", line + "\n")
@@ -1099,7 +1851,6 @@ def refresh_workflow_graph():
 
         ascii_text.tag_add(tag, start, end)
 
-
     if not lines:
         ascii_text.insert("1.0", "No history found.\n")
 
@@ -1111,52 +1862,63 @@ def refresh_workflow_graph():
             table.delete(row)
 
     # --- Fill Recent Commits table (with BRANCH column) ---
-    for c in commits:
-        short_sha = c.hexsha[:8]
-        when = datetime.datetime.fromtimestamp(c.committed_date).strftime("%Y-%m-%d")
-        author = c.author.name if c.author else "Unknown"
-        msg = c.message.splitlines()[0]
-
-        branch = _branch_hint_for_commit(repo, c.hexsha) or ""
-
-        try:
-            files_changed = len(c.stats.files or {})
-        except Exception:
-            files_changed = 0
-
-        commits_table.insert(
-            "",
-            "end",
-            values=(short_sha, when, author, branch, files_changed, msg)
-        )
+    for row in commits_rows:
+        commits_table.insert("", "end", values=row)
 
     # --- Fill Merges table ---
-    try:
-        raw = repo.git.log(
-            "--all", "--merges", "--date=short",
-            "--pretty=format:%H%x00%ad%x00%an%x00%s"
-        )
-        lines = [ln for ln in raw.split("\n") if ln] if raw else []
-    except Exception:
-        lines = []
-
-    if not lines:
+    if not merges_rows:
         merges_table.insert("", "end", values=("", "", "", "", "", "No merge commits found"))
+    else:
+        for row in merges_rows:
+            merges_table.insert("", "end", values=row)
+
+def refresh_workflow_graph_async():
+    global repo, graph_refresh_in_progress
+    if not repo:
+        messagebox.showwarning("Error", "No repository loaded.")
         return
 
-    for ln in lines:
+    if graph_refresh_in_progress:
+        return
+
+    graph_refresh_in_progress = True
+    repo_snapshot = repo
+
+    try:
+        ascii_text.config(state="normal")
+        ascii_text.delete("1.0", "end")
+        ascii_text.insert("1.0", "Loading history...\n")
+        ascii_text.config(state="disabled")
+    except Exception:
+        pass
+
+    def task():
         try:
-            sha, ad, au, msg = ln.split("\x00", 3)
-        except ValueError:
-            continue
-        try:
-            mc = repo.commit(sha)
-        except Exception:
-            mc = None
-        from_name = into_name = ''
-        if mc and len(mc.parents) >= 2:
-            from_name, into_name = _guess_merge_from_into(repo, mc)
-        merges_table.insert("", "end", values=(sha[:8], ad, au, from_name, into_name, msg))
+            data = _collect_workflow_data(repo_snapshot)
+            err = None
+        except Exception as e:
+            data = None
+            err = e
+
+        def ui_update():
+            global graph_refresh_in_progress
+            graph_refresh_in_progress = False
+            if app_closing or not root.winfo_exists():
+                return
+            if repo_snapshot is not repo:
+                return
+            if err:
+                messagebox.showerror("Error", f"Failed to read commits:\n{err}")
+                return
+            _apply_workflow_data(data)
+
+        _post_ui(ui_update)
+
+    threading.Thread(target=task, daemon=True).start()
+
+def refresh_workflow_graph():
+    # Backwards-compatible entry point (use async to keep UI responsive)
+    refresh_workflow_graph_async()
 
 def show_graph_help():
     """Popup explaining how to read the ASCII workflow graph."""
@@ -1183,6 +1945,431 @@ def show_graph_help():
     )
     messagebox.showinfo("Workflow Graph Help", help_text)
 
+def show_matplotlib_graph():
+    """Plot a matplotlib git graph based on actual repo log."""
+    global repo
+    if not repo:
+        messagebox.showwarning("Error", "No repository loaded.")
+        return
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+        from matplotlib.path import Path
+        from matplotlib.patches import PathPatch
+    except Exception as e:
+        messagebox.showerror(
+            "Matplotlib missing",
+            f"Matplotlib is required to plot the graph.\n\nError: {e}"
+        )
+        return
+
+    def rounded_elbow(ax, x0, y0, x1, y1, bend_y, r=0.22, **kw):
+        if x0 == x1:
+            ax.plot([x0, x1], [y0, y1], **kw)
+            return
+        dx = x1 - x0
+        sx = 1 if dx > 0 else -1
+        dy0 = bend_y - y0
+        sy0 = 1 if dy0 > 0 else -1
+        dy1 = y1 - bend_y
+        sy1 = 1 if dy1 > 0 else -1
+        def clamp(v, lo, hi): return max(lo, min(hi, v))
+        r1 = clamp(r, 0, abs(dy0) / 2 if dy0 != 0 else r)
+        r2 = clamp(r, 0, abs(dx) / 2 if dx != 0 else r)
+        r3 = clamp(r, 0, abs(dy1) / 2 if dy1 != 0 else r)
+        y0a = bend_y - sy0 * r1
+        x0a = x0 + sx * r2
+        x1a = x1 - sx * r2
+        y1a = bend_y + sy1 * r3
+        verts = [
+            (x0, y0),
+            (x0, y0a),
+            (x0, bend_y),
+            (x0a, bend_y),
+            (x1a, bend_y),
+            (x1, bend_y),
+            (x1, y1a),
+            (x1, y1),
+        ]
+        codes = [
+            Path.MOVETO,
+            Path.LINETO,
+            Path.CURVE3,
+            Path.CURVE3,
+            Path.LINETO,
+            Path.CURVE3,
+            Path.CURVE3,
+            Path.LINETO,
+        ]
+        ax.add_patch(PathPatch(Path(verts, codes), fill=False, **kw))
+
+    try:
+        raw = repo.git.log(
+            "--all", "--topo-order",
+            "--pretty=format:%H%x00%P%x00%s",
+            "--max-count", "120"
+        )
+        lines = [ln for ln in raw.split("\n") if ln] if raw else []
+    except Exception as e:
+        messagebox.showerror("Graph", f"Failed to read git log:\n{e}")
+        return
+
+    if not lines:
+        messagebox.showinfo("Graph", "No commits found to plot.")
+        return
+
+    commits = []
+    for ln in lines:
+        parts = ln.split("\x00", 2)
+        if len(parts) != 3:
+            continue
+        sha, parents_str, msg = parts
+        parents = parents_str.split() if parents_str else []
+        commits.append((sha, parents, msg))
+
+    parents_map = {cid: ps for cid, ps, _ in commits}
+    msg_map = {cid: m for cid, _, m in commits}
+
+    lane_of = {}
+    lane_used = set()
+
+    def alloc_lane():
+        l = 0
+        while l in lane_used:
+            l += 1
+        lane_used.add(l)
+        return l
+
+    for cid, ps, _ in commits:
+        if cid not in lane_of:
+            lane_of[cid] = alloc_lane()
+        if ps:
+            p0 = ps[0]
+            if p0 not in lane_of:
+                lane_of[p0] = lane_of[cid]
+            for p in ps[1:]:
+                if p not in lane_of:
+                    lane_of[p] = alloc_lane()
+
+    y_of = {cid: i for i, (cid, _, _) in enumerate(commits)}
+
+    def color_for_lane(l):
+        return f"C{l % 10}"
+
+    N = len(commits)
+    fig = plt.figure(figsize=(12, 0.35 * N + 2))
+    fig.patch.set_facecolor("white")
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.2, 4.0], wspace=0.03)
+    # Default subplot parameters (matching requested values).
+    fig.subplots_adjust(
+        left=0.13, bottom=0.114, right=0.483,
+        top=0.936, wspace=0.198, hspace=0.198
+    )
+    axg = fig.add_subplot(gs[0, 0])
+    axt = fig.add_subplot(gs[0, 1])
+    axg.set_facecolor("white")
+    axt.set_facecolor("white")
+
+    axt.axvline(0.0, linestyle=":", linewidth=1)
+
+    max_lane = max(lane_of.values()) if lane_of else 0
+    for lane in range(max_lane + 1):
+        axg.plot([lane, lane], [-1, N + 5], linewidth=2, alpha=0.12)
+
+    for cid, ps in parents_map.items():
+        if cid not in y_of:
+            continue
+        x0, y0 = lane_of.get(cid, 0), y_of[cid]
+        for p in ps:
+            if p not in y_of or p not in lane_of:
+                continue
+            x1, y1 = lane_of[p], y_of[p]
+            bend_y = y0 + 0.35
+            rounded_elbow(
+                axg, x0, y0, x1, y1, bend_y=bend_y, r=0.22,
+                linewidth=2, color=color_for_lane(x0)
+            )
+
+    for cid, _, _ in commits:
+        axg.scatter([lane_of.get(cid, 0)], [y_of[cid]], s=110, zorder=3,
+                    color=color_for_lane(lane_of.get(cid, 0)), edgecolors="none")
+
+    msg_font = 8 if N > 80 else 9
+    for cid, _, _ in commits:
+        text = msg_map.get(cid, "")
+        if len(text) > 60:
+            text = text[:57] + "..."
+        axt.text(0.02, y_of[cid], text, va="center", fontsize=msg_font)
+
+    axg.set_xlim(-0.7, max_lane + 0.7)
+    extra_label_space = 1.2 + (max_lane * 0.35 if max_lane else 0.0)
+    axg.set_ylim(N + extra_label_space, -0.5)
+    axt.set_ylim(N + extra_label_space, -0.5)
+    axg.axis("off")
+    axt.set_xlim(0, 1.08)
+    axt.axis("off")
+    fig.suptitle("IGRM Git Workflow Tree", y=0.995)
+    try:
+        fig.canvas.manager.set_window_title("IGRM workflow")
+    except Exception:
+        pass
+
+    # Branch labels at the bottom of each lane (local + remote)
+    try:
+        def _wrap_label(label: str, width: int = 20) -> str:
+            if not label:
+                return label
+            return "\n".join(textwrap.wrap(
+                label, width=width, break_long_words=False, break_on_hyphens=False
+            ))
+
+        lane_labels = {}
+        for br in repo.branches:
+            tip = br.commit.hexsha
+            if tip in lane_of:
+                lane_labels.setdefault(lane_of[tip], {"local": set(), "remote": set()})
+                lane_labels[lane_of[tip]]["local"].add(br.name)
+        for r in repo.remotes:
+            for ref in r.refs:
+                tip = ref.commit.hexsha
+                if tip in lane_of:
+                    lane_labels.setdefault(lane_of[tip], {"local": set(), "remote": set()})
+                    lane_labels[lane_of[tip]]["remote"].add(str(ref))
+        # If labels are long, give the figure a bit more horizontal breathing room.
+        max_label_len = 0
+        max_label_lines = 1
+        for lane, groups in lane_labels.items():
+            local_names = sorted({n for n in groups["local"] if not n.endswith("/HEAD")})
+            remote_names = sorted({n for n in groups["remote"] if not n.endswith("/HEAD")})
+            parts = []
+            if local_names:
+                parts.append(f"L: {', '.join(local_names)}")
+            if remote_names:
+                parts.append(f"R: {', '.join(remote_names)}")
+            label = " | ".join(parts)
+            if label:
+                max_label_len = max(max_label_len, len(label))
+                max_label_lines = max(max_label_lines, len(_wrap_label(label).splitlines()))
+
+        if max_label_len:
+            base_w, base_h = fig.get_size_inches()
+            lane_boost = 0.6 * max_lane
+            label_boost = min(8.0, max(0.0, (max_label_len - 18) * 0.18))
+            fig.set_size_inches(base_w + lane_boost + label_boost, base_h, forward=True)
+
+        # Only draw bottom labels when they fit cleanly; otherwise rely on the legend.
+        draw_lane_labels = (max_lane <= 4 and max_label_lines == 1 and max_label_len <= 28)
+
+        for lane, groups in lane_labels.items():
+            local_names = sorted({n for n in groups["local"] if not n.endswith("/HEAD")})
+            remote_names = sorted({n for n in groups["remote"] if not n.endswith("/HEAD")})
+            parts = []
+            if local_names:
+                parts.append(f"L: {', '.join(local_names)}")
+            if remote_names:
+                parts.append(f"R: {', '.join(remote_names)}")
+            label = " | ".join(parts)
+            if not label:
+                continue
+            if draw_lane_labels:
+                y = N + 0.8 + (lane * 0.38)
+                x = lane + (0.08 if lane % 2 == 0 else -0.08)
+                axg.text(
+                    x, y, _wrap_label(label),
+                    ha="center", va="bottom", fontsize=7.0, rotation=38
+                )
+
+        # Legend on right side: explain L/R and map lane colors to branch labels
+        if lane_labels:
+            legend_items = []
+            for lane in sorted(lane_labels.keys()):
+                groups = lane_labels[lane]
+                local_names = sorted({n for n in groups["local"] if not n.endswith("/HEAD")})
+                remote_names = sorted({n for n in groups["remote"] if not n.endswith("/HEAD")})
+                parts = []
+                if local_names:
+                    parts.append(f"L: {', '.join(local_names)}")
+                if remote_names:
+                    parts.append(f"R: {', '.join(remote_names)}")
+                label = " | ".join(parts) if parts else f"Lane {lane}"
+                legend_items.append((lane, label))
+
+            max_items = 12
+            shown = legend_items[:max_items]
+            handles = [
+                Line2D([0], [0], color=color_for_lane(lane), marker="o",
+                       linestyle="-", linewidth=2, markersize=6)
+                for lane, _ in shown
+            ]
+            labels = [lbl for _, lbl in shown]
+            if len(legend_items) > max_items and labels:
+                extra = len(legend_items) - max_items
+                labels[-1] = f"{labels[-1]}  (+{extra} more)"
+
+            wrapped_labels = [
+                "\n".join(textwrap.wrap(l, width=26, break_long_words=False, break_on_hyphens=False))
+                for l in labels
+            ]
+
+            # Keep legend within the visible canvas (avoid forcing wide figures).
+            axt.legend(
+                handles, wrapped_labels,
+                loc="upper right",
+                bbox_to_anchor=(0.98, 0.98),
+                bbox_transform=axt.transAxes,
+                fontsize=7,
+                frameon=True,
+                framealpha=0.90,
+                title="Legend (L=Local, R=Remote)",
+                title_fontsize=8,
+                borderaxespad=0.0,
+            )
+    except Exception:
+        pass
+    try:
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    except Exception as e:
+        messagebox.showerror(
+            "Matplotlib missing",
+            f"Matplotlib Tk backend is required to show the scrollable graph.\n\nError: {e}"
+        )
+        return
+
+    win = Toplevel(root)
+    win.title("IGRM workflow")
+    win.geometry("1100x800")
+    win.minsize(900, 600)
+    win.configure(bg="white")
+
+    def _on_plot_close():
+        try:
+            win.unbind_all("<MouseWheel>")
+            win.unbind_all("<Button-4>")
+            win.unbind_all("<Button-5>")
+        except Exception:
+            pass
+        try:
+            plt.close(fig)
+        except Exception:
+            pass
+        try:
+            win.destroy()
+        except Exception:
+            pass
+
+    win.protocol("WM_DELETE_WINDOW", _on_plot_close)
+
+    toolbar_frame = tk.Frame(win, bg="white")
+    toolbar_frame.pack(side="top", fill="x")
+
+    container = tk.Frame(win, bg="white")
+    container.pack(fill="both", expand=True)
+
+    plot_canvas = tk.Canvas(container, highlightthickness=0, bg="white")
+    vbar = tk.Scrollbar(container, orient="vertical", command=plot_canvas.yview)
+    hbar = tk.Scrollbar(container, orient="horizontal", command=plot_canvas.xview)
+    plot_canvas.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+
+    plot_canvas.pack(side="left", fill="both", expand=True)
+    vbar.pack(side="right", fill="y")
+    hbar.pack(side="bottom", fill="x")
+
+    inner = tk.Frame(plot_canvas, bg="white")
+    plot_canvas.create_window((0, 0), window=inner, anchor="nw")
+
+    def _sync_scrollregion(_evt=None):
+        try:
+            plot_canvas.configure(scrollregion=plot_canvas.bbox("all"))
+        except Exception:
+            pass
+
+    inner.bind("<Configure>", _sync_scrollregion)
+
+    fig_canvas = FigureCanvasTkAgg(fig, master=inner)
+    fig_widget = fig_canvas.get_tk_widget()
+    fig_widget.configure(bg="white", highlightthickness=0)
+    fig_widget.pack()
+    fig_canvas.draw()
+
+    NavigationToolbar2Tk(fig_canvas, toolbar_frame)
+    _sync_scrollregion()
+
+    def _on_plot_mousewheel(event):
+        if not win.winfo_exists() or not plot_canvas.winfo_exists():
+            return
+        if event.num == 5 or event.delta < 0:
+            plot_canvas.yview_scroll(1, "units")
+        elif event.num == 4 or event.delta > 0:
+            plot_canvas.yview_scroll(-1, "units")
+
+    win.bind("<MouseWheel>", _on_plot_mousewheel)
+    win.bind("<Button-4>", _on_plot_mousewheel)
+    win.bind("<Button-5>", _on_plot_mousewheel)
+
+# =============== Terminal Tab ===============
+
+def _ensure_repo_loaded_for_terminal():
+    if not repo:
+        messagebox.showwarning("Terminal", "No repository loaded.")
+        return False
+    return True
+
+def _append_terminal_output(text: str):
+    terminal_output.config(state="normal")
+    terminal_output.insert("end", text)
+    terminal_output.see("end")
+    terminal_output.config(state="disabled")
+
+def _append_terminal_command(text: str):
+    terminal_output.config(state="normal")
+    terminal_output.insert("end", text, "cmd")
+    terminal_output.see("end")
+    terminal_output.config(state="disabled")
+
+def run_git_command():
+    if not _ensure_repo_loaded_for_terminal():
+        return
+    cmd = terminal_entry.get().strip()
+    if not cmd:
+        return
+    if not cmd.lower().startswith("git "):
+        messagebox.showwarning("Terminal", "Only git commands are allowed.")
+        return
+    if shutil.which("git") is None:
+        msg = "Git is not installed in the system. Install it from:\nhttps://git-scm.com/"
+        messagebox.showwarning("Terminal", msg)
+        _append_terminal_output(msg + "\n")
+        return
+    terminal_entry.delete(0, "end")
+    _append_terminal_command(f"> {cmd}\n")
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=repo.working_dir,
+            shell=True,
+            text=True,
+            capture_output=True
+        )
+        if proc.stdout:
+            _append_terminal_output(proc.stdout)
+        if proc.stderr:
+            _append_terminal_output(proc.stderr)
+        if not proc.stdout and not proc.stderr:
+            _append_terminal_output("(no output)\n")
+    except Exception as e:
+        _append_terminal_output(f"Error: {e}\n")
+
+def _update_terminal_prompt():
+    try:
+        path = repo.working_dir if repo else "(no repo)"
+    except Exception:
+        path = "(no repo)"
+    try:
+        terminal_prompt_var.set(f"{path} >>> ")
+    except Exception:
+        pass
+
+
 # =============== UI ===============
 
 # Taskbar grouping on Windows (safe no-op elsewhere)
@@ -1191,8 +2378,36 @@ try:
 except Exception:
     pass
 
+def _on_app_close():
+    global app_closing
+    app_closing = True
+    try:
+        root.quit()
+        root.update_idletasks()
+    except Exception:
+        pass
+    try:
+        root.destroy()
+    except Exception:
+        pass
+
 root = tk.Tk()
 root.title("InsightsNet GitRepo Manager")
+root.protocol("WM_DELETE_WINDOW", _on_app_close)
+
+def _drain_ui_queue():
+    if app_closing or not root.winfo_exists():
+        return
+    try:
+        while True:
+            fn = _ui_queue.get_nowait()
+            try:
+                fn()
+            except Exception:
+                pass
+    except queue.Empty:
+        pass
+    root.after(50, _drain_ui_queue)
 
 def resource_path(rel_path: str) -> str:
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -1216,11 +2431,13 @@ branch_var = tk.StringVar(root)
 notebook = ttk.Notebook(root)
 main_tab  = ttk.Frame(notebook)
 graph_tab = ttk.Frame(notebook)
+terminal_tab = ttk.Frame(notebook)
 about_tab = ttk.Frame(notebook)
 auth_tab  = ttk.Frame(notebook)
 notebook.add(auth_tab,  text="Git AuthN")
 notebook.add(main_tab,  text="Main")
 notebook.add(graph_tab, text="Workflow Graph")
+notebook.add(terminal_tab, text="Terminal")
 notebook.add(about_tab, text="About")
 notebook.pack(fill="both", expand=True)
 
@@ -1319,11 +2536,17 @@ commit_msg_entry = tk.Entry(commit_section, width=55)
 commit_msg_entry.grid(row=2, column=1, columnspan=2, padx=5, pady=5)
 tk.Button(commit_section, text="Commit Changes", command=commit_changes)\
   .grid(row=3, column=0, columnspan=3, pady=10)
+
+preview_row = tk.Frame(commit_section)
+preview_row.grid(row=4, column=0, columnspan=3, pady=(0, 10))
+tk.Button(preview_row, text="Preview Changes", command=preview_changes)\
+  .grid(row=0, column=0, padx=6)
 _refresh_commit_msg_visibility()
 
 push_section = tk.LabelFrame(scrollable_frame, text="Push to Remote Repository",
                              padx=10, pady=10, relief="groove", font=("Arial", 12, "bold"))
-push_section.grid(row=3, column=0, columnspan=3, padx=10, pady=10, sticky="we")
+push_section.grid(**_PUSH_SECTION_GRID)
+push_section.grid_remove()
 
 tk.Label(
     push_section,
@@ -1339,6 +2562,7 @@ graph_top.pack(fill="x", padx=10, pady=6)
 
 tk.Button(graph_top, text="Refresh Graph", command=refresh_workflow_graph).pack(side="left")
 tk.Button(graph_top, text="?", width=2, command=show_graph_help).pack(side="left", padx=(5, 0))
+tk.Button(graph_top, text="Plot Graph", command=show_matplotlib_graph).pack(side="left", padx=(5, 0))
 
 tk.Label(
     graph_top,
@@ -1373,6 +2597,39 @@ ascii_text.tag_configure("kind_normal", foreground="black")
 ascii_text.tag_configure("kind_merge", foreground="red")          # merges = red
 ascii_text.tag_configure("kind_branch_tip", foreground="blue")    # branch tips = blue
 ascii_text.tag_configure("kind_copy", foreground="dark orange")   # copy/restore = orange
+
+# ---- Terminal Tab
+terminal_frame = tk.Frame(terminal_tab)
+terminal_frame.pack(fill="both", expand=True, padx=12, pady=12)
+
+terminal_prompt_row = tk.Frame(terminal_frame)
+terminal_prompt_row.pack(fill="x", pady=(6, 6))
+
+terminal_prompt_box = tk.Frame(terminal_prompt_row, bd=1, relief="sunken", bg="white")
+terminal_prompt_box.pack(side="left", fill="x", expand=True)
+
+terminal_prompt_var = tk.StringVar(value="(no repo) >>> ")
+terminal_prompt_label = tk.Label(
+    terminal_prompt_box,
+    textvariable=terminal_prompt_var,
+    font=("Consolas", 10),
+    bg="white"
+)
+terminal_prompt_label.pack(side="left", padx=(6, 0), pady=2)
+
+terminal_entry = tk.Entry(terminal_prompt_box, bd=0, highlightthickness=0)
+terminal_entry.pack(side="left", fill="x", expand=True, padx=(6, 6), pady=2)
+terminal_entry.bind("<Return>", lambda _e: run_git_command())
+
+tk.Button(terminal_prompt_row, text="Run Git Command", command=run_git_command).pack(side="left", padx=(8, 0))
+
+terminal_output = scrolledtext.ScrolledText(terminal_frame, wrap="word", height=18, state="disabled")
+terminal_output.pack(fill="both", expand=True)
+terminal_output.tag_configure("cmd", foreground="green")
+
+terminal_actions = tk.Frame(terminal_frame)
+terminal_actions.pack(fill="x", pady=(6, 0))
+tk.Button(terminal_actions, text="Clear Output", command=lambda: terminal_output.config(state="normal") or terminal_output.delete("1.0", "end") or terminal_output.config(state="disabled")).pack(side="left")
 
 # RIGHT: tables
 right_col = tk.Frame(graph_body)
@@ -1433,7 +2690,7 @@ except Exception:
 
 def smart_pdf_name():
     base = "igrm_User_Guide"
-    ver = "v0.17"
+    ver = "v0.26"
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
     repo_name = ""
     try:
@@ -1471,7 +2728,7 @@ tk.Label(
 tk.Button(about_tab, text="Download User Guide (PDF)", command=download_pdf).pack(pady=10)
 tk.Label(
     about_tab,
-    text="-----------------------------------------\nInsightsNet GitRepo Manager\nVersion 0.17\nDeveloped by Team InsightsNet\n© 2026",
+    text="-----------------------------------------\nInsightsNet GitRepo Manager\nVersion 0.26\nDeveloped by Team InsightsNet\n© 2026",
     font=("Arial", 12),
     pady=20
 ).pack()
@@ -1525,5 +2782,7 @@ tk.Button(auth_wrap, text="Fix Refspec & Fetch All", command=fix_refspec_and_fet
 
 # Prefill AuthN fields initially
 _prefill_auth_fields()
+_update_terminal_prompt()
+_drain_ui_queue()
 
 root.mainloop()
