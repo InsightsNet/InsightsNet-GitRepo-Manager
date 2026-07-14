@@ -13,6 +13,7 @@ import datetime
 import re
 import textwrap
 import queue
+import tempfile
 from urllib.parse import urlparse
 from git import Repo
 
@@ -28,6 +29,146 @@ _ui_queue = queue.Queue()
 def _post_ui(fn):
     """Enqueue a UI callback to run on the Tk main thread."""
     _ui_queue.put(fn)
+
+# ---- Route git's credential / SSH host-key prompts to a GUI dialog instead of
+# the terminal (this app has no terminal for the user to type into once launched
+# from a GUI). git and ssh each support an external "askpass" program: they spawn
+# it as its own process with the prompt text as argv[1] and read the typed answer
+# back from its stdout, so the helper below is a standalone script (it can't
+# reuse this process's Tk mainloop) that pops a small dialog and prints the
+# result. This covers both HTTPS username/password prompts and SSH "yes/no" host
+# key confirmation prompts, since both are just "show this text, read one line
+# back" from git/ssh's point of view.
+def _setup_git_gui_credential_prompts():
+    try:
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        helper_py = os.path.join(app_dir, "_git_askpass_gui.py")
+        helper_src = '''#!/usr/bin/env python3
+import sys
+import os
+import tempfile
+import time
+import tkinter as tk
+from tkinter import simpledialog
+
+# ssh tries several auth mechanisms per connection (a passphrase prompt per
+# candidate identity key, then password auth), each spawning this script as a
+# separate process with no shared memory. Without this, cancelling once still
+# leaves the remaining mechanisms popping the same dialog again. Remember a
+# recent cancel via a short-lived marker file so the whole operation gives up
+# after a single cancel, while an unrelated LATER operation still prompts fresh.
+CANCEL_FLAG = os.path.join(tempfile.gettempdir(), "igrm_git_askpass_cancel.flag")
+CANCEL_TTL = 20  # seconds
+
+
+def main():
+    prompt = sys.argv[1] if len(sys.argv) > 1 else "Enter value:"
+
+    try:
+        if os.path.exists(CANCEL_FLAG) and (time.time() - os.path.getmtime(CANCEL_FLAG)) < CANCEL_TTL:
+            sys.exit(1)
+    except OSError:
+        pass
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    answer = simpledialog.askstring(
+        "Git",
+        prompt,
+        show="*" if "password" in prompt.lower() else None,
+        parent=root,
+    )
+    root.destroy()
+
+    if answer is None:
+        try:
+            with open(CANCEL_FLAG, "w") as f:
+                f.write("")
+        except OSError:
+            pass
+        sys.exit(1)
+
+    try:
+        os.remove(CANCEL_FLAG)
+    except OSError:
+        pass
+    print(answer)
+
+
+if __name__ == "__main__":
+    main()
+'''
+        with open(helper_py, "w", encoding="utf-8") as f:
+            f.write(helper_src)
+
+        if os.name == "nt":
+            helper_bat = os.path.join(app_dir, "_git_askpass_gui.bat")
+            pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+            if not os.path.exists(pyw):
+                pyw = sys.executable
+            with open(helper_bat, "w", encoding="utf-8") as f:
+                f.write(f'@echo off\r\n"{pyw}" "{helper_py}" %*\r\n')
+            askpass_cmd = helper_bat
+        else:
+            os.chmod(helper_py, 0o755)
+            askpass_cmd = helper_py
+
+        os.environ["GIT_ASKPASS"] = askpass_cmd
+        os.environ["SSH_ASKPASS"] = askpass_cmd
+        # Force ssh to use SSH_ASKPASS even though this terminal has a TTY
+        # (OpenSSH otherwise prefers prompting the controlling terminal directly).
+        os.environ["SSH_ASKPASS_REQUIRE"] = "force"
+        # Don't let git fall back to prompting this terminal either.
+        os.environ["GIT_TERMINAL_PROMPT"] = "0"
+        # ssh's default NumberOfPasswordPrompts is 3: cancelling (or a wrong
+        # password) once still leaves it re-invoking SSH_ASKPASS two more times,
+        # popping the same dialog again. Cap it at 1 so cancel/close means cancel.
+        ssh_opts = ["-o NumberOfPasswordPrompts=1"]
+
+        # Unlike HTTPS, ssh has no credential.helper equivalent — password-based
+        # ssh auth (as opposed to a passphrase-protected key) has no built-in way
+        # to be "remembered" at all, so an action like Clone (which immediately
+        # fetches again to populate branches) would otherwise re-prompt right
+        # after a successful entry. ControlMaster/ControlPersist works around
+        # this the same way ssh's own connection sharing does: the first
+        # connection to a host stays open in the background (over a local Unix
+        # socket) and later ssh invocations to the same host reuse it instead of
+        # authenticating again. Not set on Windows: OpenSSH's Windows port
+        # doesn't reliably support Unix domain sockets for this.
+        if os.name != "nt":
+            control_dir = os.path.join(tempfile.gettempdir(), "igrm_ssh_control")
+            try:
+                os.makedirs(control_dir, exist_ok=True)
+                ssh_opts.append("-o ControlMaster=auto")
+                ssh_opts.append("-o ControlPersist=3600")
+                ssh_opts.append(f"-o ControlPath={os.path.join(control_dir, '%C')}")
+            except OSError:
+                pass
+
+        existing_ssh_cmd = os.environ.get("GIT_SSH_COMMAND")
+        if not existing_ssh_cmd:
+            os.environ["GIT_SSH_COMMAND"] = "ssh " + " ".join(ssh_opts)
+
+        # HTTPS credentials aren't remembered between separate git invocations by
+        # default, so an action like Clone (which immediately fetches again to
+        # populate branches) re-prompts right after a successful entry. Cache
+        # entered credentials in memory for this session via git's built-in
+        # credential-cache daemon (never touches disk, expires after an hour) —
+        # applied as an environment-scoped git config override so it doesn't
+        # touch the user's ~/.gitconfig. Not set on Windows: credential-cache
+        # relies on a Unix domain socket that isn't reliably available there.
+        if os.name != "nt":
+            os.environ["GIT_CONFIG_COUNT"] = "1"
+            os.environ["GIT_CONFIG_KEY_0"] = "credential.helper"
+            os.environ["GIT_CONFIG_VALUE_0"] = "cache --timeout=3600"
+    except Exception:
+        pass
+
+_setup_git_gui_credential_prompts()
 
 # ---- Tk cleanup guard to avoid noisy shutdown warnings ----
 try:
@@ -1953,6 +2094,7 @@ def show_matplotlib_graph():
         return
     try:
         import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_agg import FigureCanvasAgg, RendererAgg
         from matplotlib.lines import Line2D
         from matplotlib.path import Path
         from matplotlib.patches import PathPatch
@@ -1962,6 +2104,42 @@ def show_matplotlib_graph():
             f"Matplotlib is required to plot the graph.\n\nError: {e}"
         )
         return
+
+    # Some Ubuntu/FreeType builds crash with a "raster overflow" while rendering
+    # text — reproduced here for EVERY piece of text in a large figure, not just
+    # unusual glyphs, so it's not about specific characters; it's FreeType's own
+    # glyph bitmap rasterizer (FT_Render_Glyph) that's broken on this system
+    # (doesn't reproduce on Windows/macOS, whose FreeType builds differ). Redirect
+    # text drawing to matplotlib's path-based renderer instead — normally used by
+    # backends with no native font support — which extracts glyph *outlines*
+    # (a different, much more stable FreeType code path) and fills them with
+    # Agg's own path rasterizer, never calling FT_Render_Glyph at all. Verified
+    # this produces correctly positioned/rotated/aligned text.
+    def _path_based_draw_text(self, gc, x, y, s, prop, angle, ismath, mtext=None):
+        try:
+            # Newer matplotlib (>=3.10) requires mtext as a positional arg.
+            self._draw_text_as_path(gc, x, y, s, prop, angle, ismath, mtext)
+        except TypeError:
+            # Older matplotlib doesn't accept mtext here.
+            self._draw_text_as_path(gc, x, y, s, prop, angle, ismath)
+    RendererAgg.draw_text = _path_based_draw_text
+
+    plt.rcParams["font.family"] = ["DejaVu Sans"]
+
+    # Belt-and-braces in case that alone doesn't fully cover it: a small
+    # disposable-canvas probe turned out NOT to reliably predict this crash (it
+    # only showed up in the real, much larger figure, not a small test canvas), so
+    # instead of trying to predict it in advance, do a cheap up-front strip of the
+    # obvious offenders (control chars, astral-plane emoji), then — after the real
+    # figure is fully built — actually try to draw it; if that fails, binary-search
+    # the figure's Text artists to find and blank out whichever one(s) are
+    # unrenderable on this system, then draw again. See
+    # _neutralize_unrenderable_text below, used from _safe_fig_draw.
+
+    def _mpl_safe_text(s):
+        if not s:
+            return s
+        return "".join(ch for ch in s if ord(ch) >= 0x20 and ord(ch) <= 0xFFFF).strip()
 
     def rounded_elbow(ax, x0, y0, x1, y1, bend_y, r=0.22, **kw):
         if x0 == x1:
@@ -2070,6 +2248,15 @@ def show_matplotlib_graph():
     axg.set_facecolor("white")
     axt.set_facecolor("white")
 
+    # Repo-derived strings (commit messages, branch/remote names) are the only text
+    # that can realistically trigger the FreeType raster-overflow crash below (axis
+    # ticks are off and everything else is a static ASCII label) — track exactly
+    # these artists so the repair pass targets them precisely instead of walking
+    # the whole figure and tripping over unrelated/auto-generated Text objects
+    # (e.g. axis tick labels, whose text matplotlib fills in lazily during draw()
+    # and which are unrelated to this bug).
+    _repo_text_artists = []
+
     axt.axvline(0.0, linestyle=":", linewidth=1)
 
     max_lane = max(lane_of.values()) if lane_of else 0
@@ -2096,10 +2283,12 @@ def show_matplotlib_graph():
 
     msg_font = 8 if N > 80 else 9
     for cid, _, _ in commits:
-        text = msg_map.get(cid, "")
+        text = _mpl_safe_text(msg_map.get(cid, ""))
         if len(text) > 60:
             text = text[:57] + "..."
-        axt.text(0.02, y_of[cid], text, va="center", fontsize=msg_font)
+        _repo_text_artists.append(
+            axt.text(0.02, y_of[cid], text, va="center", fontsize=msg_font)
+        )
 
     axg.set_xlim(-0.7, max_lane + 0.7)
     extra_label_space = 1.2 + (max_lane * 0.35 if max_lane else 0.0)
@@ -2108,7 +2297,7 @@ def show_matplotlib_graph():
     axg.axis("off")
     axt.set_xlim(0, 1.08)
     axt.axis("off")
-    fig.suptitle("IGRM Git Workflow Tree", y=0.995)
+    _repo_text_artists.append(fig.suptitle("IGRM Git Workflow Tree", y=0.995))
     try:
         fig.canvas.manager.set_window_title("IGRM workflow")
     except Exception:
@@ -2128,13 +2317,13 @@ def show_matplotlib_graph():
             tip = br.commit.hexsha
             if tip in lane_of:
                 lane_labels.setdefault(lane_of[tip], {"local": set(), "remote": set()})
-                lane_labels[lane_of[tip]]["local"].add(br.name)
+                lane_labels[lane_of[tip]]["local"].add(_mpl_safe_text(br.name))
         for r in repo.remotes:
             for ref in r.refs:
                 tip = ref.commit.hexsha
                 if tip in lane_of:
                     lane_labels.setdefault(lane_of[tip], {"local": set(), "remote": set()})
-                    lane_labels[lane_of[tip]]["remote"].add(str(ref))
+                    lane_labels[lane_of[tip]]["remote"].add(_mpl_safe_text(str(ref)))
         # If labels are long, give the figure a bit more horizontal breathing room.
         max_label_len = 0
         max_label_lines = 1
@@ -2174,9 +2363,11 @@ def show_matplotlib_graph():
             if draw_lane_labels:
                 y = N + 0.8 + (lane * 0.38)
                 x = lane + (0.08 if lane % 2 == 0 else -0.08)
-                axg.text(
-                    x, y, _wrap_label(label),
-                    ha="center", va="bottom", fontsize=7.0, rotation=38
+                _repo_text_artists.append(
+                    axg.text(
+                        x, y, _wrap_label(label),
+                        ha="center", va="bottom", fontsize=7.0, rotation=38
+                    )
                 )
 
         # Legend on right side: explain L/R and map lane colors to branch labels
@@ -2212,7 +2403,7 @@ def show_matplotlib_graph():
             ]
 
             # Keep legend within the visible canvas (avoid forcing wide figures).
-            axt.legend(
+            _legend = axt.legend(
                 handles, wrapped_labels,
                 loc="upper right",
                 bbox_to_anchor=(0.98, 0.98),
@@ -2224,6 +2415,10 @@ def show_matplotlib_graph():
                 title_fontsize=8,
                 borderaxespad=0.0,
             )
+            _repo_text_artists.extend(_legend.get_texts())
+            _legend_title = _legend.get_title()
+            if _legend_title is not None:
+                _repo_text_artists.append(_legend_title)
     except Exception:
         pass
     try:
@@ -2289,7 +2484,132 @@ def show_matplotlib_graph():
     fig_widget = fig_canvas.get_tk_widget()
     fig_widget.configure(bg="white", highlightthickness=0)
     fig_widget.pack()
+
+    def _neutralize_unrenderable_text(target_fig, candidates_source):
+        """If target_fig can't be rasterized (FreeType raster-overflow crash on
+        some Ubuntu/FreeType builds), binary-search candidates_source (the repo-
+        derived Text artists — commit messages, branch labels, legend entries,
+        titles) to find and blank out whichever one(s) are the cause, then it
+        becomes drawable. If that alone isn't enough, fall back to every other
+        Text artist in the figure (e.g. axis tick labels) as a second pass —
+        deliberately not the first choice, since that content is filled in
+        lazily by matplotlib during draw() itself and can mutate between our
+        probe redraws, which is less stable to bisect over. Returns the list of
+        original strings that had to be blanked.
+        """
+        import matplotlib.text as mtext
+        # FigureCanvasAgg(target_fig) reassigns target_fig.canvas to itself; restore
+        # the real Tk canvas afterwards so the figure/canvas pairing stays correct.
+        _real_canvas = target_fig.canvas
+        probe_canvas = FigureCanvasAgg(target_fig)
+
+        def can_draw():
+            try:
+                probe_canvas.draw()
+                return True
+            except RuntimeError:
+                return False
+
+        dropped = []
+
+        def isolate_one(candidates):
+            # Invariant: can_draw() is currently False with `candidates` intact.
+            if len(candidates) == 1:
+                t = candidates[0]
+                dropped.append(t.get_text())
+                t.set_text("")
+                return
+            mid = len(candidates) // 2
+            left, right = candidates[:mid], candidates[mid:]
+            saved_right = [t.get_text() for t in right]
+            for t in right:
+                t.set_text("")
+            culprit_in_right = can_draw()
+            # Always restore right before recursing — otherwise the next level
+            # bisects over an already-blanked slice and blames an arbitrary
+            # (already-empty) entry instead of the real culprit.
+            for t, s in zip(right, saved_right):
+                t.set_text(s)
+            if culprit_in_right:
+                isolate_one(right)
+            else:
+                isolate_one(left)
+
+        def run_passes(pool, guard_cap):
+            guard = 0
+            while not can_draw() and guard < guard_cap:
+                remaining = [t for t in pool if t.get_text()]
+                if not remaining:
+                    break
+                isolate_one(remaining)
+                guard += 1
+            return guard
+
+        try:
+            guard1 = run_passes(candidates_source, len(candidates_source) + 5)
+            print(
+                f"[graph] text repair phase 1 (repo text): {len(dropped)} item(s) "
+                f"blanked in {guard1} pass(es), draw now succeeds: {can_draw()}"
+            )
+            guard2 = 0
+            if not can_draw():
+                seen_ids = {id(t) for t in candidates_source}
+                extra = [
+                    t for t in target_fig.findobj(mtext.Text)
+                    if id(t) not in seen_ids
+                ]
+                guard2 = run_passes(extra, len(extra) + 5)
+                print(
+                    f"[graph] text repair phase 2 (other text, e.g. tick labels): "
+                    f"{len(dropped)} total item(s) blanked after {guard2} more "
+                    f"pass(es), draw now succeeds: {can_draw()}"
+                )
+        finally:
+            target_fig.canvas = _real_canvas
+        return dropped
+
+    # Last-resort safety net: Tk schedules its own idle-time redraws (e.g. on
+    # resize/scroll) that call fig_canvas.draw() again outside our control, so this
+    # wrapper stays installed for the life of the window, not just the first draw.
+    _orig_fig_draw = fig_canvas.draw
+    _repair_attempted = {"done": False}
+
+    def _safe_fig_draw(*a, **kw):
+        try:
+            return _orig_fig_draw(*a, **kw)
+        except RuntimeError:
+            pass
+        if not _repair_attempted["done"]:
+            _repair_attempted["done"] = True
+            dropped = _neutralize_unrenderable_text(fig, _repo_text_artists)
+            try:
+                result = _orig_fig_draw(*a, **kw)
+            except RuntimeError as e2:
+                if win.winfo_exists():
+                    messagebox.showerror(
+                        "Graph rendering issue",
+                        "Could not render part of the graph due to a system font/"
+                        f"FreeType issue:\n\n{e2}\n\n"
+                        "The window will stay open but may look incomplete.",
+                        parent=win,
+                    )
+                return None
+            if dropped and win.winfo_exists():
+                messagebox.showinfo(
+                    "Graph rendering issue",
+                    f"{len(dropped)} commit message(s)/branch label(s) could not be "
+                    "rendered on this system's fonts and were hidden so the graph "
+                    "could load.",
+                    parent=win,
+                )
+            return result
+        return None
+
+    fig_canvas.draw = _safe_fig_draw
     fig_canvas.draw()
+
+    if not win.winfo_exists():
+        return
 
     NavigationToolbar2Tk(fig_canvas, toolbar_frame)
     _sync_scrollregion()
@@ -2391,7 +2711,7 @@ def _on_app_close():
     except Exception:
         pass
 
-root = tk.Tk()
+root = tk.Tk(className="Insightsnetgitrepomanager")
 root.title("InsightsNet GitRepo Manager")
 root.protocol("WM_DELETE_WINDOW", _on_app_close)
 
@@ -2414,8 +2734,12 @@ def resource_path(rel_path: str) -> str:
     return os.path.join(base, rel_path)
 
 # Window icon
+# insightsnet_logo.ico only embeds a single 256x256 image; Windows needs a
+# 16x16/32x32 variant inside the .ico to render the title-bar/taskbar icon,
+# so it silently fell back to Tk's default feather icon. insightsnet_logo_taskbar.ico
+# carries the small sizes needed for that.
 try:
-    root.iconbitmap(resource_path("insightsnet_logo.ico"))
+    root.iconbitmap(resource_path("insightsnet_logo_taskbar.ico"))
 except Exception:
     pass
 try:
@@ -2423,6 +2747,36 @@ try:
     root.iconphoto(True, _icon_img)
 except Exception:
     pass
+
+# iconphoto() above only sets the window's own icon. On Ubuntu/GNOME, the
+# Dock/taskbar icon for a running app is instead looked up from an installed
+# .desktop file matched by the window's WM_CLASS (set via className= above) —
+# launching straight from a terminal (python3 app26.py) has no such file, so
+# GNOME shows a generic fallback icon there. Registering one (with
+# StartupWMClass matching our className) fixes the Dock icon too. No effect on
+# Windows/macOS, which don't use .desktop files at all.
+if sys.platform.startswith("linux"):
+    try:
+        _icon_png_path = resource_path("insightsnet_logo.png")
+        if os.path.exists(_icon_png_path):
+            _apps_dir = os.path.join(os.path.expanduser("~"), ".local", "share", "applications")
+            os.makedirs(_apps_dir, exist_ok=True)
+            _desktop_path = os.path.join(_apps_dir, "insightsnet-gitrepo-manager.desktop")
+            _desktop_content = (
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                "Name=InsightsNet GitRepo Manager\n"
+                f'Exec="{sys.executable}" "{os.path.abspath(__file__)}"\n'
+                f"Icon={_icon_png_path}\n"
+                f"StartupWMClass={root.winfo_class()}\n"
+                "Terminal=false\n"
+                "Categories=Development;\n"
+            )
+            with open(_desktop_path, "w", encoding="utf-8") as f:
+                f.write(_desktop_content)
+            os.chmod(_desktop_path, 0o755)
+    except Exception:
+        pass
 
 root.geometry("980x760")
 branch_var = tk.StringVar(root)
