@@ -11,9 +11,12 @@ import ctypes
 import threading
 import datetime
 import re
-import textwrap
 import queue
 import tempfile
+import webbrowser
+import hashlib
+import colorsys
+import pathlib
 from urllib.parse import urlparse
 from git import Repo
 
@@ -2086,106 +2089,96 @@ def show_graph_help():
     )
     messagebox.showinfo("Workflow Graph Help", help_text)
 
-def show_matplotlib_graph():
-    """Plot a matplotlib git graph based on actual repo log."""
+def _find_chromium_browser():
+    """Return a path to a Chromium-based browser (Edge preferred, then Chrome/
+    Chromium), used to open the graph in an app-mode popup window. Returns
+    None if nothing Chromium-based is found (e.g. a Firefox-only Linux box) —
+    the caller falls back to the OS default browser in that case.
+    """
+    candidates = []
+    path_names = []
+
+    if sys.platform == "win32":
+        program_dirs = [
+            os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+            os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+            os.environ.get("LOCALAPPDATA", ""),
+        ]
+        for pf in program_dirs:
+            if not pf:
+                continue
+            candidates.append(os.path.join(pf, "Microsoft", "Edge", "Application", "msedge.exe"))
+            candidates.append(os.path.join(pf, "Google", "Chrome", "Application", "chrome.exe"))
+        path_names = ["msedge", "chrome", "google-chrome"]
+    elif sys.platform == "darwin":
+        candidates = [
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            os.path.expanduser("~/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+            os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        ]
+        path_names = ["microsoft-edge", "google-chrome", "chromium"]
+    else:
+        # Linux/BSD: no fixed install path convention, so rely on PATH — these
+        # are the common package/binary names across distros and Chrome's own
+        # .deb/.rpm installer.
+        path_names = [
+            "microsoft-edge", "microsoft-edge-stable",
+            "google-chrome", "google-chrome-stable",
+            "chromium-browser", "chromium",
+        ]
+
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    for name in path_names:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+def _open_html_as_popup(file_path: str, width: int = 1300, height: int = 850):
+    """Open an HTML file in a chromeless "app mode" window (no tabs/address bar),
+    so it reads as a popup rather than a normal browser tab. Falls back to the
+    default browser if a Chromium-based one can't be located.
+    """
+    file_url = pathlib.Path(file_path).as_uri()
+    browser = _find_chromium_browser()
+    if browser:
+        try:
+            subprocess.Popen([
+                browser,
+                f"--app={file_url}",
+                f"--window-size={width},{height}",
+            ])
+            return
+        except Exception:
+            pass
+    webbrowser.open(file_url)
+
+def show_plotly_graph():
+    """Plot an interactive Plotly git graph (opens in the default browser)."""
     global repo
     if not repo:
         messagebox.showwarning("Error", "No repository loaded.")
         return
     try:
-        import matplotlib.pyplot as plt
-        from matplotlib.backends.backend_agg import FigureCanvasAgg, RendererAgg
-        from matplotlib.lines import Line2D
-        from matplotlib.path import Path
-        from matplotlib.patches import PathPatch
+        import plotly.graph_objects as go
     except Exception as e:
         messagebox.showerror(
-            "Matplotlib missing",
-            f"Matplotlib is required to plot the graph.\n\nError: {e}"
+            "Plotly missing",
+            f"Plotly is required to plot the graph.\n\nError: {e}\n\n"
+            "Install it with: pip install plotly"
         )
         return
-
-    # Some Ubuntu/FreeType builds crash with a "raster overflow" while rendering
-    # text — reproduced here for EVERY piece of text in a large figure, not just
-    # unusual glyphs, so it's not about specific characters; it's FreeType's own
-    # glyph bitmap rasterizer (FT_Render_Glyph) that's broken on this system
-    # (doesn't reproduce on Windows/macOS, whose FreeType builds differ). Redirect
-    # text drawing to matplotlib's path-based renderer instead — normally used by
-    # backends with no native font support — which extracts glyph *outlines*
-    # (a different, much more stable FreeType code path) and fills them with
-    # Agg's own path rasterizer, never calling FT_Render_Glyph at all. Verified
-    # this produces correctly positioned/rotated/aligned text.
-    def _path_based_draw_text(self, gc, x, y, s, prop, angle, ismath, mtext=None):
-        try:
-            # Newer matplotlib (>=3.10) requires mtext as a positional arg.
-            self._draw_text_as_path(gc, x, y, s, prop, angle, ismath, mtext)
-        except TypeError:
-            # Older matplotlib doesn't accept mtext here.
-            self._draw_text_as_path(gc, x, y, s, prop, angle, ismath)
-    RendererAgg.draw_text = _path_based_draw_text
-
-    plt.rcParams["font.family"] = ["DejaVu Sans"]
-
-    # Belt-and-braces in case that alone doesn't fully cover it: a small
-    # disposable-canvas probe turned out NOT to reliably predict this crash (it
-    # only showed up in the real, much larger figure, not a small test canvas), so
-    # instead of trying to predict it in advance, do a cheap up-front strip of the
-    # obvious offenders (control chars, astral-plane emoji), then — after the real
-    # figure is fully built — actually try to draw it; if that fails, binary-search
-    # the figure's Text artists to find and blank out whichever one(s) are
-    # unrenderable on this system, then draw again. See
-    # _neutralize_unrenderable_text below, used from _safe_fig_draw.
-
-    def _mpl_safe_text(s):
-        if not s:
-            return s
-        return "".join(ch for ch in s if ord(ch) >= 0x20 and ord(ch) <= 0xFFFF).strip()
-
-    def rounded_elbow(ax, x0, y0, x1, y1, bend_y, r=0.22, **kw):
-        if x0 == x1:
-            ax.plot([x0, x1], [y0, y1], **kw)
-            return
-        dx = x1 - x0
-        sx = 1 if dx > 0 else -1
-        dy0 = bend_y - y0
-        sy0 = 1 if dy0 > 0 else -1
-        dy1 = y1 - bend_y
-        sy1 = 1 if dy1 > 0 else -1
-        def clamp(v, lo, hi): return max(lo, min(hi, v))
-        r1 = clamp(r, 0, abs(dy0) / 2 if dy0 != 0 else r)
-        r2 = clamp(r, 0, abs(dx) / 2 if dx != 0 else r)
-        r3 = clamp(r, 0, abs(dy1) / 2 if dy1 != 0 else r)
-        y0a = bend_y - sy0 * r1
-        x0a = x0 + sx * r2
-        x1a = x1 - sx * r2
-        y1a = bend_y + sy1 * r3
-        verts = [
-            (x0, y0),
-            (x0, y0a),
-            (x0, bend_y),
-            (x0a, bend_y),
-            (x1a, bend_y),
-            (x1, bend_y),
-            (x1, y1a),
-            (x1, y1),
-        ]
-        codes = [
-            Path.MOVETO,
-            Path.LINETO,
-            Path.CURVE3,
-            Path.CURVE3,
-            Path.LINETO,
-            Path.CURVE3,
-            Path.CURVE3,
-            Path.LINETO,
-        ]
-        ax.add_patch(PathPatch(Path(verts, codes), fill=False, **kw))
 
     try:
         raw = repo.git.log(
             "--all", "--topo-order",
-            "--pretty=format:%H%x00%P%x00%s",
-            "--max-count", "120"
+            "--pretty=format:%H%x00%P%x00%an%x00%ad%x00%s",
+            "--date=short",
+            "--max-count", "300",
         )
         lines = [ln for ln in raw.split("\n") if ln] if raw else []
     except Exception as e:
@@ -2198,15 +2191,14 @@ def show_matplotlib_graph():
 
     commits = []
     for ln in lines:
-        parts = ln.split("\x00", 2)
-        if len(parts) != 3:
+        parts = ln.split("\x00", 4)
+        if len(parts) != 5:
             continue
-        sha, parents_str, msg = parts
+        sha, parents_str, author, date, msg = parts
         parents = parents_str.split() if parents_str else []
-        commits.append((sha, parents, msg))
+        commits.append((sha, parents, author, date, msg))
 
-    parents_map = {cid: ps for cid, ps, _ in commits}
-    msg_map = {cid: m for cid, _, m in commits}
+    y_of = {cid: i for i, (cid, *_) in enumerate(commits)}
 
     lane_of = {}
     lane_used = set()
@@ -2218,7 +2210,7 @@ def show_matplotlib_graph():
         lane_used.add(l)
         return l
 
-    for cid, ps, _ in commits:
+    for cid, ps, *_ in commits:
         if cid not in lane_of:
             lane_of[cid] = alloc_lane()
         if ps:
@@ -2229,402 +2221,232 @@ def show_matplotlib_graph():
                 if p not in lane_of:
                     lane_of[p] = alloc_lane()
 
-    y_of = {cid: i for i, (cid, _, _) in enumerate(commits)}
+    surface = "#fcfcfb"
+    text_ink = "#52514e"
+    gridline = "#e1e0d9"
 
-    def color_for_lane(l):
-        return f"C{l % 10}"
+    all_lanes = sorted(set(lane_of.values()))
+    max_lane = all_lanes[-1] if all_lanes else 0
+    n_commits = len(commits)
+    text_x = max_lane + 1.3
 
-    N = len(commits)
-    fig = plt.figure(figsize=(12, 0.35 * N + 2))
-    fig.patch.set_facecolor("white")
-    gs = fig.add_gridspec(1, 2, width_ratios=[1.2, 4.0], wspace=0.03)
-    # Default subplot parameters (matching requested values).
-    fig.subplots_adjust(
-        left=0.13, bottom=0.114, right=0.483,
-        top=0.936, wspace=0.198, hspace=0.198
-    )
-    axg = fig.add_subplot(gs[0, 0])
-    axt = fig.add_subplot(gs[0, 1])
-    axg.set_facecolor("white")
-    axt.set_facecolor("white")
-
-    # Repo-derived strings (commit messages, branch/remote names) are the only text
-    # that can realistically trigger the FreeType raster-overflow crash below (axis
-    # ticks are off and everything else is a static ASCII label) — track exactly
-    # these artists so the repair pass targets them precisely instead of walking
-    # the whole figure and tripping over unrelated/auto-generated Text objects
-    # (e.g. axis tick labels, whose text matplotlib fills in lazily during draw()
-    # and which are unrelated to this bug).
-    _repo_text_artists = []
-
-    axt.axvline(0.0, linestyle=":", linewidth=1)
-
-    max_lane = max(lane_of.values()) if lane_of else 0
-    for lane in range(max_lane + 1):
-        axg.plot([lane, lane], [-1, N + 5], linewidth=2, alpha=0.12)
-
-    for cid, ps in parents_map.items():
-        if cid not in y_of:
-            continue
-        x0, y0 = lane_of.get(cid, 0), y_of[cid]
-        for p in ps:
-            if p not in y_of or p not in lane_of:
-                continue
-            x1, y1 = lane_of[p], y_of[p]
-            bend_y = y0 + 0.35
-            rounded_elbow(
-                axg, x0, y0, x1, y1, bend_y=bend_y, r=0.22,
-                linewidth=2, color=color_for_lane(x0)
-            )
-
-    for cid, _, _ in commits:
-        axg.scatter([lane_of.get(cid, 0)], [y_of[cid]], s=110, zorder=3,
-                    color=color_for_lane(lane_of.get(cid, 0)), edgecolors="none")
-
-    msg_font = 8 if N > 80 else 9
-    for cid, _, _ in commits:
-        text = _mpl_safe_text(msg_map.get(cid, ""))
-        if len(text) > 60:
-            text = text[:57] + "..."
-        _repo_text_artists.append(
-            axt.text(0.02, y_of[cid], text, va="center", fontsize=msg_font)
-        )
-
-    axg.set_xlim(-0.7, max_lane + 0.7)
-    extra_label_space = 1.2 + (max_lane * 0.35 if max_lane else 0.0)
-    axg.set_ylim(N + extra_label_space, -0.5)
-    axt.set_ylim(N + extra_label_space, -0.5)
-    axg.axis("off")
-    axt.set_xlim(0, 1.08)
-    axt.axis("off")
-    _repo_text_artists.append(fig.suptitle("IGRM Git Workflow Tree", y=0.995))
-    try:
-        fig.canvas.manager.set_window_title("IGRM workflow")
-    except Exception:
-        pass
-
-    # Branch labels at the bottom of each lane (local + remote)
-    try:
-        def _wrap_label(label: str, width: int = 20) -> str:
-            if not label:
-                return label
-            return "\n".join(textwrap.wrap(
-                label, width=width, break_long_words=False, break_on_hyphens=False
-            ))
-
-        lane_labels = {}
-        for br in repo.branches:
-            tip = br.commit.hexsha
+    # Branch/remote tips per lane, for legend labels.
+    lane_labels = {}
+    for br in repo.branches:
+        tip = br.commit.hexsha
+        if tip in lane_of:
+            lane_labels.setdefault(lane_of[tip], {"local": set(), "remote": set()})
+            lane_labels[lane_of[tip]]["local"].add(br.name)
+    for r in repo.remotes:
+        for ref in r.refs:
+            tip = ref.commit.hexsha
             if tip in lane_of:
                 lane_labels.setdefault(lane_of[tip], {"local": set(), "remote": set()})
-                lane_labels[lane_of[tip]]["local"].add(_mpl_safe_text(br.name))
-        for r in repo.remotes:
-            for ref in r.refs:
-                tip = ref.commit.hexsha
-                if tip in lane_of:
-                    lane_labels.setdefault(lane_of[tip], {"local": set(), "remote": set()})
-                    lane_labels[lane_of[tip]]["remote"].add(_mpl_safe_text(str(ref)))
-        # If labels are long, give the figure a bit more horizontal breathing room.
-        max_label_len = 0
-        max_label_lines = 1
-        for lane, groups in lane_labels.items():
-            local_names = sorted({n for n in groups["local"] if not n.endswith("/HEAD")})
-            remote_names = sorted({n for n in groups["remote"] if not n.endswith("/HEAD")})
-            parts = []
-            if local_names:
-                parts.append(f"L: {', '.join(local_names)}")
-            if remote_names:
-                parts.append(f"R: {', '.join(remote_names)}")
-            label = " | ".join(parts)
-            if label:
-                max_label_len = max(max_label_len, len(label))
-                max_label_lines = max(max_label_lines, len(_wrap_label(label).splitlines()))
+                lane_labels[lane_of[tip]]["remote"].add(str(ref))
 
-        if max_label_len:
-            base_w, base_h = fig.get_size_inches()
-            lane_boost = 0.6 * max_lane
-            label_boost = min(8.0, max(0.0, (max_label_len - 18) * 0.18))
-            fig.set_size_inches(base_w + lane_boost + label_boost, base_h, forward=True)
+    def label_for_lane(lane):
+        groups = lane_labels.get(lane)
+        if not groups:
+            return f"Lane {lane}"
+        local_names = sorted(n for n in groups["local"] if not n.endswith("/HEAD"))
+        remote_names = sorted(n for n in groups["remote"] if not n.endswith("/HEAD"))
+        parts = []
+        if local_names:
+            parts.append(f"L: {', '.join(local_names)}")
+        if remote_names:
+            parts.append(f"R: {', '.join(remote_names)}")
+        return " | ".join(parts) if parts else f"Lane {lane}"
 
-        # Only draw bottom labels when they fit cleanly; otherwise rely on the legend.
-        draw_lane_labels = (max_lane <= 4 and max_label_lines == 1 and max_label_len <= 28)
+    # Color policy: main/master is always red. The next few branches get a
+    # fixed, requested color order; anything beyond that gets a color derived
+    # from a hash of its label, so it's stable across replots (not reshuffled
+    # every time you open the graph) without needing to extend the fixed list.
+    MAIN_COLOR = "#e34948"
+    FIXED_SEQUENCE = ["#008300", "#2a78d6", "#8c564b", "#eb6834", "#e87ba4"]  # green, blue, brown, orange, pink
 
-        for lane, groups in lane_labels.items():
-            local_names = sorted({n for n in groups["local"] if not n.endswith("/HEAD")})
-            remote_names = sorted({n for n in groups["remote"] if not n.endswith("/HEAD")})
-            parts = []
-            if local_names:
-                parts.append(f"L: {', '.join(local_names)}")
-            if remote_names:
-                parts.append(f"R: {', '.join(remote_names)}")
-            label = " | ".join(parts)
-            if not label:
+    def _is_main_like(lane):
+        groups = lane_labels.get(lane)
+        if not groups:
+            return False
+        names = list(groups["local"]) + list(groups["remote"])
+        return any(n.rsplit("/", 1)[-1].lower() in ("main", "master") for n in names)
+
+    def _stable_fallback_color(label):
+        # Hash-derived hue, kept out of red's wedge (reserved for main/master).
+        digest = int(hashlib.md5(label.encode("utf-8")).hexdigest(), 16)
+        hue = ((digest % 300) + 30) / 360.0  # 30..330 degrees, skipping ~330-30 (red)
+        r, g, b = colorsys.hls_to_rgb(hue, 0.45, 0.55)
+        return "#{:02x}{:02x}{:02x}".format(int(r * 255), int(g * 255), int(b * 255))
+
+    lane_color = {}
+    _fixed_iter = iter(FIXED_SEQUENCE)
+    for lane in all_lanes:
+        if _is_main_like(lane):
+            lane_color[lane] = MAIN_COLOR
+            continue
+        nxt = next(_fixed_iter, None)
+        lane_color[lane] = nxt if nxt else _stable_fallback_color(label_for_lane(lane))
+
+    def color_for_lane(l):
+        return lane_color.get(l, MAIN_COLOR)
+
+    commits_by_lane = {lane: [] for lane in all_lanes}
+    for sha, ps, author, date, msg in commits:
+        commits_by_lane[lane_of.get(sha, 0)].append((sha, ps, author, date, msg))
+
+    fig = go.Figure()
+
+    # Faint vertical guide line per lane, recessive (gridline-gray, hairline),
+    # so lanes stay readable as columns even before any hover/click.
+    for lane in all_lanes:
+        fig.add_trace(go.Scatter(
+            x=[lane, lane], y=[-1, n_commits + 1],
+            mode="lines", line=dict(color=gridline, width=1),
+            hoverinfo="skip", showlegend=False,
+            legendgroup=f"lane{lane}", meta=["guide"],
+        ))
+
+    # Everything below is grouped per lane (edges, nodes, message labels) via
+    # legendgroup + groupclick="togglegroup", so clicking a lane's legend entry
+    # hides that whole lane from the graph, not just its swatch.
+    for lane in all_lanes:
+        group = f"lane{lane}"
+        color = color_for_lane(lane)
+
+        edge_x, edge_y = [], []
+        for sha, ps, *_ in commits_by_lane[lane]:
+            if sha not in y_of:
                 continue
-            if draw_lane_labels:
-                y = N + 0.8 + (lane * 0.38)
-                x = lane + (0.08 if lane % 2 == 0 else -0.08)
-                _repo_text_artists.append(
-                    axg.text(
-                        x, y, _wrap_label(label),
-                        ha="center", va="bottom", fontsize=7.0, rotation=38
-                    )
-                )
+            x0, y0 = lane_of.get(sha, 0), y_of[sha]
+            for p in ps:
+                if p not in y_of or p not in lane_of:
+                    continue
+                x1, y1 = lane_of[p], y_of[p]
+                bend_y = y0 + 0.4
+                edge_x += [x0, x0, x1, x1, None]
+                edge_y += [y0, bend_y, bend_y, y1, None]
+        if edge_x:
+            fig.add_trace(go.Scatter(
+                x=edge_x, y=edge_y,
+                mode="lines", line=dict(color=color, width=2),
+                hoverinfo="skip", showlegend=False, legendgroup=group,
+                meta=["edge"],
+            ))
 
-        # Legend on right side: explain L/R and map lane colors to branch labels
-        if lane_labels:
-            legend_items = []
-            for lane in sorted(lane_labels.keys()):
-                groups = lane_labels[lane]
-                local_names = sorted({n for n in groups["local"] if not n.endswith("/HEAD")})
-                remote_names = sorted({n for n in groups["remote"] if not n.endswith("/HEAD")})
-                parts = []
-                if local_names:
-                    parts.append(f"L: {', '.join(local_names)}")
-                if remote_names:
-                    parts.append(f"R: {', '.join(remote_names)}")
-                label = " | ".join(parts) if parts else f"Lane {lane}"
-                legend_items.append((lane, label))
+        xs, ys, customdata, msg_texts = [], [], [], []
+        for sha, ps, author, date, msg in commits_by_lane[lane]:
+            hover_msg = msg if len(msg) <= 200 else msg[:197] + "..."
+            label_msg = msg if len(msg) <= 70 else msg[:67] + "..."
+            xs.append(lane)
+            ys.append(y_of[sha])
+            customdata.append([sha[:7], date, author, hover_msg])
+            msg_texts.append(label_msg)
 
-            max_items = 12
-            shown = legend_items[:max_items]
-            handles = [
-                Line2D([0], [0], color=color_for_lane(lane), marker="o",
-                       linestyle="-", linewidth=2, markersize=6)
-                for lane, _ in shown
-            ]
-            labels = [lbl for _, lbl in shown]
-            if len(legend_items) > max_items and labels:
-                extra = len(legend_items) - max_items
-                labels[-1] = f"{labels[-1]}  (+{extra} more)"
+        # Node markers carry the lane color and are this lane's one legend
+        # entry; a surface-colored ring keeps them legible where lines cross.
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="markers",
+            marker=dict(size=12, color=color, line=dict(width=2, color=surface)),
+            customdata=customdata,
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Date: %{customdata[1]}<br>"
+                "Author: %{customdata[2]}<br>"
+                "%{customdata[3]}"
+                "<extra></extra>"
+            ),
+            name=label_for_lane(lane),
+            legendgroup=group,
+            showlegend=True,
+            meta=["node"],
+        ))
 
-            wrapped_labels = [
-                "\n".join(textwrap.wrap(l, width=26, break_long_words=False, break_on_hyphens=False))
-                for l in labels
-            ]
+        # Commit message, in text ink (never the series color) so identity
+        # still reads from the colored dot beside it, not the label itself.
+        fig.add_trace(go.Scatter(
+            x=[text_x] * len(xs), y=ys, mode="text",
+            text=msg_texts, textposition="middle right",
+            textfont=dict(size=12, color=text_ink),
+            hoverinfo="skip", showlegend=False, legendgroup=group,
+            meta=["text"],
+        ))
 
-            # Keep legend within the visible canvas (avoid forcing wide figures).
-            _legend = axt.legend(
-                handles, wrapped_labels,
-                loc="upper right",
-                bbox_to_anchor=(0.98, 0.98),
-                bbox_transform=axt.transAxes,
-                fontsize=7,
-                frameon=True,
-                framealpha=0.90,
-                title="Legend (L=Local, R=Remote)",
-                title_fontsize=8,
-                borderaxespad=0.0,
-            )
-            _repo_text_artists.extend(_legend.get_texts())
-            _legend_title = _legend.get_title()
-            if _legend_title is not None:
-                _repo_text_artists.append(_legend_title)
-    except Exception:
-        pass
+    fig.update_layout(
+        title=dict(
+            text="IGRM Git Workflow Tree",
+            font=dict(color="#0b0b0b"),
+            subtitle=dict(
+                text="Click a legend entry to show/hide a branch · double-click to recolor it",
+                font=dict(size=11, color=text_ink),
+            ),
+        ),
+        template="plotly_white",
+        font=dict(color=text_ink),
+        paper_bgcolor=surface,
+        plot_bgcolor=surface,
+        xaxis=dict(visible=False, range=[-0.7, text_x + 10]),
+        yaxis=dict(visible=False, autorange="reversed"),
+        legend=dict(
+            title=dict(text="Legend (L=Local, R=Remote)", font=dict(color=text_ink)),
+            font=dict(color=text_ink),
+            groupclick="togglegroup",
+            x=1.02, y=1, xanchor="left",
+        ),
+        autosize=True,
+        height=max(500, 28 * n_commits + 150),
+        margin=dict(l=20, r=220, t=60, b=20),
+    )
+
+    # Lets a user pick their own color per branch: double-clicking a legend
+    # entry opens a native color picker instead of Plotly's default "isolate
+    # this trace" behavior, then restyles every edge/node trace in that lane's
+    # legendgroup (identified via each trace's `meta` tag — the neutral guide
+    # line and commit-message text are deliberately left untouched).
+    recolor_script = """
+    var gd = document.getElementById('igrm-graph-div');
+    if (gd) {
+      var _igrmPickers = {};
+      function _igrmGetPicker(group, initial) {
+        if (_igrmPickers[group]) return _igrmPickers[group];
+        var inp = document.createElement('input');
+        inp.type = 'color';
+        inp.value = initial;
+        inp.style.position = 'fixed';
+        inp.style.left = '-9999px';
+        inp.style.top = '-9999px';
+        document.body.appendChild(inp);
+        inp.addEventListener('input', function () {
+          var newColor = inp.value;
+          gd.data.forEach(function (tr, i) {
+            if (tr.legendgroup !== group) return;
+            var kind = tr.meta && tr.meta[0];
+            if (kind === 'node') Plotly.restyle(gd, {'marker.color': newColor}, [i]);
+            if (kind === 'edge') Plotly.restyle(gd, {'line.color': newColor}, [i]);
+          });
+        });
+        _igrmPickers[group] = inp;
+        return inp;
+      }
+      gd.on('plotly_legenddoubleclick', function (evt) {
+        var tr = gd.data[evt.curveNumber];
+        var group = tr.legendgroup;
+        if (!group) return false;
+        var current = (tr.marker && tr.marker.color) || '#000000';
+        _igrmGetPicker(group, current).click();
+        return false;
+      });
+    }
+    """
+
     try:
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-    except Exception as e:
-        messagebox.showerror(
-            "Matplotlib missing",
-            f"Matplotlib Tk backend is required to show the scrollable graph.\n\nError: {e}"
+        out_path = os.path.join(tempfile.gettempdir(), "igrm_workflow_graph.html")
+        fig.write_html(
+            out_path, auto_open=False, config={"responsive": True},
+            div_id="igrm-graph-div", post_script=recolor_script,
         )
-        return
-
-    win = Toplevel(root)
-    win.title("IGRM workflow")
-    win.geometry("1100x800")
-    win.minsize(900, 600)
-    win.configure(bg="white")
-
-    def _on_plot_close():
-        try:
-            win.unbind_all("<MouseWheel>")
-            win.unbind_all("<Button-4>")
-            win.unbind_all("<Button-5>")
-        except Exception:
-            pass
-        try:
-            plt.close(fig)
-        except Exception:
-            pass
-        try:
-            win.destroy()
-        except Exception:
-            pass
-
-    win.protocol("WM_DELETE_WINDOW", _on_plot_close)
-
-    toolbar_frame = tk.Frame(win, bg="white")
-    toolbar_frame.pack(side="top", fill="x")
-
-    container = tk.Frame(win, bg="white")
-    container.pack(fill="both", expand=True)
-
-    plot_canvas = tk.Canvas(container, highlightthickness=0, bg="white")
-    vbar = tk.Scrollbar(container, orient="vertical", command=plot_canvas.yview)
-    hbar = tk.Scrollbar(container, orient="horizontal", command=plot_canvas.xview)
-    plot_canvas.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
-
-    plot_canvas.pack(side="left", fill="both", expand=True)
-    vbar.pack(side="right", fill="y")
-    hbar.pack(side="bottom", fill="x")
-
-    inner = tk.Frame(plot_canvas, bg="white")
-    plot_canvas.create_window((0, 0), window=inner, anchor="nw")
-
-    def _sync_scrollregion(_evt=None):
-        try:
-            plot_canvas.configure(scrollregion=plot_canvas.bbox("all"))
-        except Exception:
-            pass
-
-    inner.bind("<Configure>", _sync_scrollregion)
-
-    fig_canvas = FigureCanvasTkAgg(fig, master=inner)
-    fig_widget = fig_canvas.get_tk_widget()
-    fig_widget.configure(bg="white", highlightthickness=0)
-    fig_widget.pack()
-
-    def _neutralize_unrenderable_text(target_fig, candidates_source):
-        """If target_fig can't be rasterized (FreeType raster-overflow crash on
-        some Ubuntu/FreeType builds), binary-search candidates_source (the repo-
-        derived Text artists — commit messages, branch labels, legend entries,
-        titles) to find and blank out whichever one(s) are the cause, then it
-        becomes drawable. If that alone isn't enough, fall back to every other
-        Text artist in the figure (e.g. axis tick labels) as a second pass —
-        deliberately not the first choice, since that content is filled in
-        lazily by matplotlib during draw() itself and can mutate between our
-        probe redraws, which is less stable to bisect over. Returns the list of
-        original strings that had to be blanked.
-        """
-        import matplotlib.text as mtext
-        # FigureCanvasAgg(target_fig) reassigns target_fig.canvas to itself; restore
-        # the real Tk canvas afterwards so the figure/canvas pairing stays correct.
-        _real_canvas = target_fig.canvas
-        probe_canvas = FigureCanvasAgg(target_fig)
-
-        def can_draw():
-            try:
-                probe_canvas.draw()
-                return True
-            except RuntimeError:
-                return False
-
-        dropped = []
-
-        def isolate_one(candidates):
-            # Invariant: can_draw() is currently False with `candidates` intact.
-            if len(candidates) == 1:
-                t = candidates[0]
-                dropped.append(t.get_text())
-                t.set_text("")
-                return
-            mid = len(candidates) // 2
-            left, right = candidates[:mid], candidates[mid:]
-            saved_right = [t.get_text() for t in right]
-            for t in right:
-                t.set_text("")
-            culprit_in_right = can_draw()
-            # Always restore right before recursing — otherwise the next level
-            # bisects over an already-blanked slice and blames an arbitrary
-            # (already-empty) entry instead of the real culprit.
-            for t, s in zip(right, saved_right):
-                t.set_text(s)
-            if culprit_in_right:
-                isolate_one(right)
-            else:
-                isolate_one(left)
-
-        def run_passes(pool, guard_cap):
-            guard = 0
-            while not can_draw() and guard < guard_cap:
-                remaining = [t for t in pool if t.get_text()]
-                if not remaining:
-                    break
-                isolate_one(remaining)
-                guard += 1
-            return guard
-
-        try:
-            guard1 = run_passes(candidates_source, len(candidates_source) + 5)
-            print(
-                f"[graph] text repair phase 1 (repo text): {len(dropped)} item(s) "
-                f"blanked in {guard1} pass(es), draw now succeeds: {can_draw()}"
-            )
-            guard2 = 0
-            if not can_draw():
-                seen_ids = {id(t) for t in candidates_source}
-                extra = [
-                    t for t in target_fig.findobj(mtext.Text)
-                    if id(t) not in seen_ids
-                ]
-                guard2 = run_passes(extra, len(extra) + 5)
-                print(
-                    f"[graph] text repair phase 2 (other text, e.g. tick labels): "
-                    f"{len(dropped)} total item(s) blanked after {guard2} more "
-                    f"pass(es), draw now succeeds: {can_draw()}"
-                )
-        finally:
-            target_fig.canvas = _real_canvas
-        return dropped
-
-    # Last-resort safety net: Tk schedules its own idle-time redraws (e.g. on
-    # resize/scroll) that call fig_canvas.draw() again outside our control, so this
-    # wrapper stays installed for the life of the window, not just the first draw.
-    _orig_fig_draw = fig_canvas.draw
-    _repair_attempted = {"done": False}
-
-    def _safe_fig_draw(*a, **kw):
-        try:
-            return _orig_fig_draw(*a, **kw)
-        except RuntimeError:
-            pass
-        if not _repair_attempted["done"]:
-            _repair_attempted["done"] = True
-            dropped = _neutralize_unrenderable_text(fig, _repo_text_artists)
-            try:
-                result = _orig_fig_draw(*a, **kw)
-            except RuntimeError as e2:
-                if win.winfo_exists():
-                    messagebox.showerror(
-                        "Graph rendering issue",
-                        "Could not render part of the graph due to a system font/"
-                        f"FreeType issue:\n\n{e2}\n\n"
-                        "The window will stay open but may look incomplete.",
-                        parent=win,
-                    )
-                return None
-            if dropped and win.winfo_exists():
-                messagebox.showinfo(
-                    "Graph rendering issue",
-                    f"{len(dropped)} commit message(s)/branch label(s) could not be "
-                    "rendered on this system's fonts and were hidden so the graph "
-                    "could load.",
-                    parent=win,
-                )
-            return result
-        return None
-
-    fig_canvas.draw = _safe_fig_draw
-    fig_canvas.draw()
-
-    if not win.winfo_exists():
-        return
-
-    NavigationToolbar2Tk(fig_canvas, toolbar_frame)
-    _sync_scrollregion()
-
-    def _on_plot_mousewheel(event):
-        if not win.winfo_exists() or not plot_canvas.winfo_exists():
-            return
-        if event.num == 5 or event.delta < 0:
-            plot_canvas.yview_scroll(1, "units")
-        elif event.num == 4 or event.delta > 0:
-            plot_canvas.yview_scroll(-1, "units")
-
-    win.bind("<MouseWheel>", _on_plot_mousewheel)
-    win.bind("<Button-4>", _on_plot_mousewheel)
-    win.bind("<Button-5>", _on_plot_mousewheel)
+        _open_html_as_popup(out_path)
+    except Exception as e:
+        messagebox.showerror("Graph", f"Failed to open graph in browser:\n{e}")
 
 # =============== Terminal Tab ===============
 
@@ -2916,7 +2738,7 @@ graph_top.pack(fill="x", padx=10, pady=6)
 
 tk.Button(graph_top, text="Refresh Graph", command=refresh_workflow_graph).pack(side="left")
 tk.Button(graph_top, text="?", width=2, command=show_graph_help).pack(side="left", padx=(5, 0))
-tk.Button(graph_top, text="Plot Graph", command=show_matplotlib_graph).pack(side="left", padx=(5, 0))
+tk.Button(graph_top, text="Plot Graph", command=show_plotly_graph).pack(side="left", padx=(5, 0))
 
 tk.Label(
     graph_top,
@@ -3044,7 +2866,7 @@ except Exception:
 
 def smart_pdf_name():
     base = "igrm_User_Guide"
-    ver = "v0.26"
+    ver = "v0.28"
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
     repo_name = ""
     try:
@@ -3082,7 +2904,7 @@ tk.Label(
 tk.Button(about_tab, text="Download User Guide (PDF)", command=download_pdf).pack(pady=10)
 tk.Label(
     about_tab,
-    text="-----------------------------------------\nInsightsNet GitRepo Manager\nVersion 0.26\nDeveloped by Team InsightsNet\n© 2026",
+    text="-----------------------------------------\nInsightsNet GitRepo Manager\nVersion 0.28\nDeveloped by Team InsightsNet\n© 2026",
     font=("Arial", 12),
     pady=20
 ).pack()

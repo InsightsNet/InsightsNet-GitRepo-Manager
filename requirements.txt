@@ -9,3 +9,4 @@ pyinstaller-hooks-contrib==2026.6
 pywin32-ctypes==0.2.3
 setuptools==83.0.0
 smmap==5.0.3
+plotly
