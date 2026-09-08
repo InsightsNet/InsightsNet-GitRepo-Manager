@@ -17,6 +17,9 @@ import webbrowser
 import hashlib
 import colorsys
 import pathlib
+import json
+import urllib.request
+import urllib.error
 from urllib.parse import urlparse
 from git import Repo
 
@@ -236,7 +239,8 @@ def _git_global_get(key: str) -> str | None:
     try:
         out = subprocess.run(
             ["git", "config", "--global", "--get", key],
-            capture_output=True, text=True, check=False
+            capture_output=True, text=True, check=False,
+            startupinfo=_win_startupinfo(),
         )
         v = (out.stdout or "").strip()
         return v or None
@@ -246,13 +250,109 @@ def _git_global_get(key: str) -> str | None:
 def _git_global_set(key: str, value: str) -> bool:
     try:
         subprocess.run(["git", "config", "--global", key, value],
-                       capture_output=True, text=True, check=True)
+                       capture_output=True, text=True, check=True,
+                       startupinfo=_win_startupinfo())
         return True
     except Exception:
         return False
 
+def _prompt_identity_dialog() -> bool:
+    """Modal: capture name/email + scope, write it, and return True so the caller
+    can continue the commit in one step (instead of bouncing to another tab)."""
+    global repo
+    if not repo:
+        return False
+
+    # Prefill from the AuthN tab, then global config, then the OS user name.
+    pre_name = pre_email = ""
+    if 'auth_name_var' in globals():
+        pre_name = auth_name_var.get().strip()
+        pre_email = auth_email_var.get().strip()
+    pre_name = pre_name or _git_global_get("user.name") or \
+        os.environ.get("USERNAME") or os.environ.get("USER") or ""
+    pre_email = pre_email or _git_global_get("user.email") or ""
+
+    win = Toplevel(root)
+    win.title("Git identity needed")
+    win.transient(root)
+    win.resizable(False, False)
+    win.grab_set()
+
+    result = {"ok": False}
+    frm = tk.Frame(win, padx=18, pady=16)
+    frm.pack(fill="both", expand=True)
+
+    tk.Label(frm, text="Commits need an author name and email.",
+             font=("Arial", 10)).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+
+    name_var = tk.StringVar(value=pre_name)
+    email_var = tk.StringVar(value=pre_email)
+
+    tk.Label(frm, text="Name:", anchor="e", width=8).grid(row=1, column=0, sticky="e", pady=3)
+    name_entry = tk.Entry(frm, textvariable=name_var, width=36)
+    name_entry.grid(row=1, column=1, sticky="w", pady=3)
+    tk.Label(frm, text="Email:", anchor="e", width=8).grid(row=2, column=0, sticky="e", pady=3)
+    tk.Entry(frm, textvariable=email_var, width=36).grid(row=2, column=1, sticky="w", pady=3)
+
+    scope_var = tk.StringVar(value="global")
+    scope_frame = tk.Frame(frm)
+    scope_frame.grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
+    tk.Radiobutton(scope_frame, text="All repositories on this machine (global)",
+                   variable=scope_var, value="global").pack(anchor="w")
+    tk.Radiobutton(scope_frame, text="This repository only",
+                   variable=scope_var, value="repo").pack(anchor="w")
+
+    tk.Label(frm, text="Tip: use an email registered on your GitLab / GitHub account.",
+             font=("Arial", 8), fg="#777").grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+    err = tk.Label(frm, text="", font=("Arial", 8), fg="#c00")
+    err.grid(row=5, column=0, columnspan=2, sticky="w")
+
+    def _save_and_continue():
+        n = name_var.get().strip()
+        e = email_var.get().strip()
+        if not n or not e:
+            err.config(text="Enter both a name and an email.")
+            return
+        if "@" not in e or "." not in e.rsplit("@", 1)[-1]:
+            err.config(text="That doesn't look like an email address.")
+            return
+        try:
+            if scope_var.get() == "global":
+                if not (_git_global_set("user.name", n) and _git_global_set("user.email", e)):
+                    err.config(text="Could not write global Git config.")
+                    return
+            else:
+                with repo.config_writer() as cw:
+                    cw.set_value('user', 'name', n)
+                    cw.set_value('user', 'email', e)
+        except Exception as ex:
+            err.config(text=f"Could not save identity: {ex}")
+            return
+        try:
+            if 'auth_name_var' in globals():
+                auth_name_var.set(n)
+                auth_email_var.set(e)
+        except Exception:
+            pass
+        result["ok"] = True
+        win.destroy()
+
+    btns = tk.Frame(frm)
+    btns.grid(row=6, column=0, columnspan=2, pady=(14, 0))
+    tk.Button(btns, text="Save & Commit", command=_save_and_continue, width=14).pack(side="left", padx=6)
+    tk.Button(btns, text="Cancel", command=win.destroy, width=10).pack(side="left", padx=6)
+
+    name_entry.focus_set()
+    win.wait_window()
+    return result["ok"]
+
+
 def _ensure_identity_before_commit() -> bool:
-    """Ensure repo has user.name/email before committing; try UI values if missing."""
+    """Ensure git can resolve an author identity before committing.
+
+    A repo-local OR global identity is fine (config_reader() merges both). Only
+    when neither exists do we prompt - inline, so the commit continues in one step.
+    """
     global repo, auth_name_var, auth_email_var
     if not repo:
         return False
@@ -261,24 +361,7 @@ def _ensure_identity_before_commit() -> bool:
     if name and email:
         return True
 
-    ui_name = (auth_name_var.get() if 'auth_name_var' in globals() else '').strip()
-    ui_email = (auth_email_var.get() if 'auth_email_var' in globals() else '').strip()
-
-    if ui_name and ui_email:
-        try:
-            with repo.config_writer() as cw:
-                cw.set_value('user', 'name', ui_name)
-                cw.set_value('user', 'email', ui_email)
-            return True
-        except Exception as e:
-            messagebox.showerror("Git AuthN", f"Could not write repo identity:\n{e}")
-            return False
-
-    messagebox.showwarning(
-        "Git identity missing",
-        "Git author name/email are not set. Please open the 'Git AuthN' tab and set them."
-    )
-    return False
+    return _prompt_identity_dialog()
 
 def _apply_identity_repo():
     """Save name/email from AuthN tab into THIS repo's .git/config."""
@@ -350,6 +433,712 @@ def _prefill_auth_fields():
     auth_name_var.set(name)
     auth_email_var.set(email)
 
+# =============== HTTPS Personal Access Token (native credential helper) ===============
+# git invokes credential.helper automatically for every https:// transfer, so once
+# a token is "approved" into the OS-native store (Git Credential Manager on Windows,
+# osxkeychain on macOS, libsecret on Linux) clone/fetch/push authenticate with no
+# prompt and Repo.clone_from needs no special handling. The secret is only ever
+# piped to git over stdin (never argv, where it would show in the process list) and
+# is never written by us to any git config or repo file.
+
+CRED_CMD_TIMEOUT = 20  # seconds; a hung helper shouldn't freeze the GUI thread
+
+
+def _run_git_credential(verb: str, host: str, username: str = "", password: str = "",
+                        protocol: str = "https", interactive: bool = False):
+    """Pipe a credential description to `git credential <verb>` over stdin.
+
+    verb is 'fill', 'approve' or 'reject'. When interactive is False (the default)
+    git is told not to prompt (no terminal, no askpass) so a missing credential
+    fails cleanly instead of popping the GUI askpass dialog.
+    Returns (returncode, stdout, stderr).
+    """
+    lines = [f"protocol={protocol}", f"host={host}"]
+    if username:
+        lines.append(f"username={username}")
+    if password:
+        lines.append(f"password={password}")
+    stdin = "\n".join(lines) + "\n\n"
+
+    cmd = ["git", "credential", verb]
+    env = os.environ.copy()
+    if not interactive:
+        # No terminal prompt, no GUI askpass, and stop Git Credential Manager from
+        # popping its own auth window when it has nothing stored for the host.
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GCM_INTERACTIVE"] = "never"
+        env.pop("GIT_ASKPASS", None)
+        env.pop("SSH_ASKPASS", None)
+        cmd = ["git", "-c", "credential.interactive=false", "credential", verb]
+    try:
+        res = subprocess.run(
+            cmd,
+            input=stdin, text=True, capture_output=True,
+            startupinfo=_win_startupinfo(), env=env, timeout=CRED_CMD_TIMEOUT,
+        )
+        return res.returncode, (res.stdout or ""), (res.stderr or "")
+    except FileNotFoundError:
+        return 127, "", "git executable not found."
+    except subprocess.TimeoutExpired:
+        return 124, "", "git credential timed out."
+    except Exception as e:  # pragma: no cover - defensive
+        return 1, "", str(e)
+
+
+def _parse_credential_output(text: str):
+    """Pull (username, password) out of `git credential fill` stdout."""
+    user = pw = None
+    for line in text.splitlines():
+        if line.startswith("username="):
+            user = line[len("username="):]
+        elif line.startswith("password="):
+            pw = line[len("password="):]
+    return user, pw
+
+
+def _configured_cred_helpers() -> list[str]:
+    """Every credential.helper value git currently sees (any scope)."""
+    try:
+        res = subprocess.run(
+            ["git", "config", "--get-all", "credential.helper"],
+            text=True, capture_output=True, startupinfo=_win_startupinfo(), check=False,
+        )
+        return [l.strip() for l in (res.stdout or "").splitlines() if l.strip()]
+    except Exception:
+        return []
+
+
+def _persistent_cred_helper_present() -> bool:
+    """True if a *storing* helper is configured.
+
+    The app itself injects `credential.helper=cache` via GIT_CONFIG_* on non-Windows
+    (in-memory, expires in an hour), so a lone `cache` does not count as somewhere a
+    PAT can actually be kept.
+    """
+    for h in _configured_cred_helpers():
+        first = h.split()[0] if h else ""
+        base = first.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if base and base not in ("cache", "cache--timeout"):
+            return True
+    return False
+
+
+def _git_core_dir() -> str:
+    try:
+        res = subprocess.run(["git", "--exec-path"], text=True, capture_output=True,
+                             startupinfo=_win_startupinfo(), check=False)
+        return (res.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def _has_credential_backend(name: str) -> bool:
+    """Is a `git-credential-<name>` helper actually installed?"""
+    if shutil.which(f"git-credential-{name}"):
+        return True
+    core = _git_core_dir()
+    if core:
+        exe = f"git-credential-{name}" + (".exe" if sys.platform.startswith("win") else "")
+        if os.path.isfile(os.path.join(core, exe)):
+            return True
+    return False
+
+
+def _default_credential_helper() -> str:
+    """Best native credential store for this platform."""
+    if sys.platform.startswith("win"):
+        # Git for Windows renamed the helper 'manager-core' -> 'manager' in 2.39;
+        # pick whichever this install actually ships.
+        for h in ("manager", "manager-core"):
+            if _has_credential_backend(h):
+                return h
+        return "manager"
+    if sys.platform == "darwin":
+        return "osxkeychain"
+    if _has_credential_backend("libsecret"):
+        return "libsecret"
+    for p in ("/usr/lib/git-core/git-credential-libsecret",
+              "/usr/libexec/git-core/git-credential-libsecret"):
+        if os.path.isfile(p):
+            return "libsecret"
+    return "store"  # plaintext ~/.git-credentials - callers warn about this
+
+
+def _https_token_stored(host: str):
+    """Non-interactive lookup: returns (username, password) or (None, None)."""
+    if not host:
+        return None, None
+    rc, out, _ = _run_git_credential("fill", host, interactive=False)
+    if rc != 0:
+        return None, None
+    return _parse_credential_output(out)
+
+
+def _probe_token_api(host: str, token: str):
+    """Hit the provider's /user endpoint.
+
+    Returns (ok, who, detail, meta). meta may carry 'scopes' (list[str], possibly
+    empty for a fine-grained token) and 'expires' (ISO date string).
+    """
+    h = (host or "").lower()
+    is_github = (h == "github.com")
+    is_bitbucket = (h == "bitbucket.org")
+    if is_github:
+        url, keys = "https://api.github.com/user", ("login",)
+    elif is_bitbucket:
+        url, keys = "https://api.bitbucket.org/2.0/user", ("username", "nickname")
+    else:  # gitlab.com or self-hosted GitLab
+        url, keys = f"https://{host}/api/v4/user", ("username",)
+
+    def _get(u, timeout=15):
+        req = urllib.request.Request(u, headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "InsightsNet-GitRepo-Manager",
+        })
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    meta = {}
+    try:
+        with _get(url) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+            if is_github:
+                sc = resp.headers.get("X-OAuth-Scopes")
+                if sc is not None:
+                    meta["scopes"] = [s.strip() for s in sc.split(",") if s.strip()]
+                exp = resp.headers.get("github-authentication-token-expiration")
+                if exp:
+                    meta["expires"] = exp.strip().split(" ")[0]
+        who = next((str(data[k]) for k in keys if data.get(k)), None) or \
+            data.get("name") or "(unknown)"
+    except urllib.error.HTTPError as e:
+        hint = {401: "invalid or expired token",
+                403: "token lacks the required scope, or SSO is not authorised"}.get(e.code, "")
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        return False, "", f"HTTP {e.code} {hint}".strip() + (f"\n{body}" if body else ""), {}
+    except Exception as e:
+        return False, "", str(e), {}
+
+    # GitLab exposes the current token's own scopes/expiry via a second endpoint.
+    if not is_github and not is_bitbucket:
+        try:
+            with _get(f"https://{host}/api/v4/personal_access_tokens/self", timeout=10) as r2:
+                t = json.loads(r2.read().decode("utf-8", "replace"))
+            if isinstance(t, dict):
+                if t.get("scopes"):
+                    meta["scopes"] = list(t["scopes"])
+                if t.get("expires_at"):
+                    meta["expires"] = str(t["expires_at"])[:10]
+        except Exception:
+            pass
+
+    return True, who, "", meta
+
+
+def _days_until(iso_date: str):
+    """Whole days from today to an ISO date/datetime, or None if unparseable."""
+    for parse in (
+        lambda s: datetime.datetime.fromisoformat(s.replace("Z", "+00:00")),
+        lambda s: datetime.datetime.strptime(s[:10], "%Y-%m-%d"),
+    ):
+        try:
+            return (parse(iso_date).date() - datetime.date.today()).days
+        except Exception:
+            continue
+    return None
+
+
+def _format_token_meta(meta: dict) -> str:
+    """One-liner-per-fact summary of scopes / expiry for a token, or ''."""
+    if not meta:
+        return ""
+    bits = []
+    if "scopes" in meta:
+        bits.append("Scopes: " + (", ".join(meta["scopes"]) if meta["scopes"]
+                                  else "(none listed - fine-grained or scope-less token)"))
+    exp = meta.get("expires")
+    if exp:
+        days = _days_until(exp)
+        if days is None:
+            bits.append(f"Expires: {exp}")
+        elif days < 0:
+            bits.append(f"Expires: {exp}  (EXPIRED)")
+        else:
+            bits.append(f"Expires: {exp}  ({days} day(s) left)")
+    return "\n".join(bits)
+
+
+# ---- Registry of hosts we've saved a token for (hostnames only, no secrets) ----
+
+def _pat_registry_path() -> str:
+    return os.path.join(os.path.expanduser("~"),
+                        ".insightsnet_gitrepo_manager", "https_hosts.json")
+
+
+def _pat_registry_load() -> list[str]:
+    try:
+        with open(_pat_registry_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return [str(x) for x in data.get("hosts", [])] if isinstance(data, dict) else []
+    except Exception:
+        return []
+
+
+def _pat_registry_save(hosts) -> None:
+    try:
+        p = _pat_registry_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump({"hosts": sorted({h for h in hosts if h})}, fh, indent=2)
+    except Exception:
+        pass
+
+
+def _pat_registry_add(host: str) -> None:
+    if host:
+        _pat_registry_save(_pat_registry_load() + [host])
+
+
+def _pat_registry_remove(host: str) -> None:
+    _pat_registry_save([h for h in _pat_registry_load() if h != host])
+
+
+def _git_credentials_file_hosts() -> list:
+    """(host, username) pairs from the plaintext 'store' helper files."""
+    out = []
+    for p in (os.path.join(os.path.expanduser("~"), ".git-credentials"),
+              os.path.join(os.path.expanduser("~"), ".config", "git", "credentials")):
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if "://" not in line:
+                        continue
+                    try:
+                        u = urlparse(line)
+                    except ValueError:
+                        continue
+                    if u.hostname:
+                        out.append((u.hostname, u.username or ""))
+        except OSError:
+            pass
+    return out
+
+
+def _windows_cred_hosts() -> list:
+    """Hosts with a 'git:https://...' entry in Windows Credential Manager."""
+    if not sys.platform.startswith("win"):
+        return []
+    try:
+        res = subprocess.run(["cmdkey", "/list"], text=True, capture_output=True,
+                             startupinfo=_win_startupinfo(), check=False)
+    except Exception:
+        return []
+    return re.findall(r'git:https?://([^\s/]+)', res.stdout or "")
+
+
+def _list_stored_https_credentials() -> list:
+    """Best-effort inventory of hosts that have an HTTPS token on this machine."""
+    seen = {}
+
+    def _touch(host, source):
+        host = (host or "").strip().lower()
+        if not host:
+            return None
+        d = seen.setdefault(host, {"host": host, "username": "",
+                                   "source": set(), "status": ""})
+        d["source"].add(source)
+        return d
+
+    for hst in _pat_registry_load():
+        _touch(hst, "app")
+    for hst, usr in _git_credentials_file_hosts():
+        d = _touch(hst, "git-credentials")
+        if d and usr and not d["username"]:
+            d["username"] = usr
+    for hst in _windows_cred_hosts():
+        _touch(hst, "credential-manager")
+
+    rows = []
+    for host, d in sorted(seen.items()):
+        usr, pw = _https_token_stored(host)
+        if pw:
+            d["status"] = "valid"
+            if usr:
+                d["username"] = usr
+        else:
+            d["status"] = "not found"
+        d["source"] = " + ".join(sorted(d["source"]))
+        rows.append(d)
+    return rows
+
+
+def _pat_default_username(host: str) -> str:
+    """Username that reliably pairs with a PAT for the given host."""
+    h = (host or "").lower()
+    if "gitlab" in h:
+        return "oauth2"
+    if h == "bitbucket.org":
+        return ""  # Bitbucket needs the real account name; make the user supply it
+    return "x-access-token"  # GitHub ignores the username with a PAT
+
+
+def _save_https_token():
+    """Store the PAT from the AuthN tab into the native git credential helper."""
+    global auth_pat_host_var, auth_pat_user_var, auth_pat_token_var, auth_pat_status_var
+    host = auth_pat_host_var.get().strip()
+    user = auth_pat_user_var.get().strip()
+    token = auth_pat_token_var.get().strip()
+    if not host or not token:
+        messagebox.showwarning("HTTPS Token", "Enter at least a host and a token.")
+        return
+    if "/" in host or " " in host:
+        messagebox.showwarning("HTTPS Token", f"'{host}' is not a bare hostname.")
+        return
+    if not user:
+        user = _pat_default_username(host)
+        if not user:
+            messagebox.showwarning(
+                "HTTPS Token",
+                "Enter the account username for this host (Bitbucket needs your "
+                "real username, not an email).")
+            return
+        auth_pat_user_var.set(user)
+
+    if not _persistent_cred_helper_present():
+        helper = _default_credential_helper()
+        extra = ("\n\nNOTE: no system keyring helper was found, so the token would "
+                 "be saved in PLAINTEXT at ~/.git-credentials."
+                 if helper == "store" else "")
+        if not messagebox.askyesno(
+            "HTTPS Token",
+            "Git has no credential helper configured, so there is nowhere to keep "
+            f"the token.\n\nConfigure '{helper}' in your global Git config now?{extra}"):
+            return
+        if not _git_global_set("credential.helper", helper):
+            messagebox.showerror("HTTPS Token",
+                                 "Failed to set credential.helper in global Git config.")
+            return
+
+    rc, out, err = _run_git_credential("approve", host, user, token)
+    if rc != 0:
+        messagebox.showerror("HTTPS Token",
+                             f"git credential approve failed:\n{(err or out).strip()}")
+        return
+    _pat_registry_add(host)
+    auth_pat_token_var.set("")  # don't leave the secret sitting in the widget
+    auth_pat_status_var.set(f"Token stored for {user}@{host}.")
+    messagebox.showinfo(
+        "HTTPS Token",
+        f"Token stored for {user}@{host} via your Git credential helper.\n\n"
+        "HTTPS clone / fetch / push will now authenticate automatically.\n"
+        'Use "Test Token" to verify it against the server.')
+
+
+def _test_https_token():
+    """Verify the stored (or typed) token really authenticates to the host."""
+    global auth_pat_host_var, auth_pat_user_var, auth_pat_token_var, auth_pat_status_var
+    host = auth_pat_host_var.get().strip()
+    if not host:
+        messagebox.showwarning("HTTPS Token", "Enter a host to test.")
+        return
+    user, token = _https_token_stored(host)
+    from_store = bool(token)
+    if not token:
+        token = auth_pat_token_var.get().strip()
+        user = user or auth_pat_user_var.get().strip()
+    if not token:
+        messagebox.showinfo(
+            "HTTPS Token",
+            f"No token is stored for {host}, and none is typed above.")
+        return
+
+    # If the token is already in the helper, the most honest check is a real git
+    # operation against the loaded repo (when it lives on this host). A token that
+    # is only typed (not yet saved) can't be exercised that way, so probe the API.
+    origin_url = get_origin_url()
+    oh, _ = _parse_origin_host_and_path()
+    if from_store and repo and oh == host and origin_url.startswith(("http://", "https://")):
+        try:
+            repo.git.ls_remote(origin_url)
+        except Exception as e:
+            messagebox.showerror("HTTPS Token", f"ls-remote against origin failed:\n{e}")
+            return
+        _, _, _, meta = _probe_token_api(host, token)   # best-effort scope/expiry info
+        extra = _format_token_meta(meta)
+        status_extra = "  " + extra.replace("\n", "  ") if extra else ""
+        auth_pat_status_var.set(f"Token OK for {host} (ls-remote succeeded).{status_extra}")
+        messagebox.showinfo(
+            "HTTPS Token",
+            f"Success: authenticated to {host} and listed refs for the loaded repo."
+            + (f"\n\n{extra}" if extra else ""))
+        return
+
+    ok, who, detail, meta = _probe_token_api(host, token)
+    if ok:
+        extra = _format_token_meta(meta)
+        status_extra = "  " + extra.replace("\n", "  ") if extra else ""
+        auth_pat_status_var.set(f"Token OK for {host} (as {who}).{status_extra}")
+        messagebox.showinfo("HTTPS Token",
+                            f"Success: authenticated to {host} as {who}."
+                            + (f"\n\n{extra}" if extra else ""))
+    else:
+        messagebox.showerror("HTTPS Token", f"Token check failed for {host}:\n{detail}")
+
+
+def _remove_https_token():
+    """Drop the stored token for the host from the credential helper."""
+    global auth_pat_host_var, auth_pat_user_var, auth_pat_status_var
+    host = auth_pat_host_var.get().strip()
+    if not host:
+        messagebox.showwarning("HTTPS Token", "Enter the host whose token to remove.")
+        return
+    user, _ = _https_token_stored(host)
+    user = user or auth_pat_user_var.get().strip()
+    if not messagebox.askyesno("HTTPS Token",
+                               f"Remove the stored HTTPS token for {host}?"):
+        return
+    rc, out, err = _run_git_credential("reject", host, user)
+    if rc != 0:
+        messagebox.showerror("HTTPS Token",
+                             f"git credential reject failed:\n{(err or out).strip()}")
+        return
+    _pat_registry_remove(host)
+    auth_pat_status_var.set(f"No token stored for {host}.")
+    messagebox.showinfo("HTTPS Token", f"Removed the stored token for {host}.")
+
+
+def _prefill_pat_fields():
+    """Set the token host from the loaded repo's origin and report stored state."""
+    if 'auth_pat_host_var' not in globals():
+        return
+    host, _ = _parse_origin_host_and_path()
+    origin_url = get_origin_url()
+    if not host or not origin_url.startswith(("http://", "https://")):
+        if host:
+            auth_pat_host_var.set(host)
+        auth_pat_status_var.set("")
+        return
+    auth_pat_host_var.set(host)
+    user, token = _https_token_stored(host)
+    if token:
+        if user:
+            auth_pat_user_var.set(user)
+        auth_pat_status_var.set(f"A token is already stored for {user or '?'}@{host}.")
+    else:
+        if not auth_pat_user_var.get().strip():
+            auth_pat_user_var.set(_pat_default_username(host))
+        auth_pat_status_var.set(f"No token stored for {host} yet.")
+
+
+# =============== AuthN: HTTPS / SSH configuration windows ===============
+# The Git AuthN tab shows only two buttons; each opens its method's full
+# configuration in a separate window so the tab itself stays uncluttered.
+
+_auth_child_windows = {}  # key -> Toplevel; each method opens at most one window
+
+
+def _singleton_auth_window(key: str, title: str, geometry: str):
+    """Return a fresh Toplevel for `key`, or None if one is already open (raised)."""
+    w = _auth_child_windows.get(key)
+    if w is not None:
+        try:
+            if w.winfo_exists():
+                w.deiconify()
+                w.lift()
+                w.focus_set()
+                return None
+        except tk.TclError:
+            pass
+    w = Toplevel(root)
+    w.title(title)
+    w.transient(root)
+    w.geometry(geometry)
+    _auth_child_windows[key] = w
+    return w
+
+
+def open_stored_tokens_window():
+    """Best-effort table of every host that has an HTTPS token on this machine."""
+    win = _singleton_auth_window("https_stored", "Stored HTTPS Tokens", "660x360")
+    if win is None:
+        return
+
+    frm = tk.Frame(win, padx=14, pady=12)
+    frm.pack(fill="both", expand=True)
+    tk.Label(frm, text="HTTPS tokens saved on this machine",
+             font=("Arial", 11, "bold")).pack(anchor="w")
+    tk.Label(frm, text="Collected from this app's own record, ~/.git-credentials, and "
+             "(on Windows) Credential Manager. Passwords/tokens are never shown.",
+             font=("Arial", 8), fg="#666", justify="left").pack(anchor="w", pady=(0, 8))
+
+    table_wrap = tk.Frame(frm)
+    table_wrap.pack(fill="both", expand=True)
+    cols = ("host", "username", "source", "status")
+    tree = ttk.Treeview(table_wrap, columns=cols, show="headings", selectmode="browse")
+    for c, t, w in (("host", "Host", 210), ("username", "Username", 130),
+                    ("source", "Source", 170), ("status", "Status", 90)):
+        tree.heading(c, text=t)
+        tree.column(c, width=w, anchor="w")
+    vb = ttk.Scrollbar(table_wrap, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=vb.set)
+    tree.pack(side="left", fill="both", expand=True)
+    vb.pack(side="right", fill="y")
+
+    empty_lbl = tk.Label(frm, text="", font=("Arial", 9), fg="#a60")
+    empty_lbl.pack(anchor="w", pady=(6, 0))
+
+    def _refresh():
+        # Enumeration spawns a `git credential fill` per host; do it off the UI thread.
+        tree.delete(*tree.get_children())
+        empty_lbl.config(text="Loading…")
+
+        def work():
+            try:
+                rows = _list_stored_https_credentials()
+            except Exception:
+                rows = []
+
+            def apply_rows():
+                if not tree.winfo_exists():
+                    return
+                tree.delete(*tree.get_children())
+                for d in rows:
+                    tree.insert("", "end", iid=d["host"],
+                                values=(d["host"], d["username"] or "-",
+                                        d["source"], d["status"]))
+                empty_lbl.config(text="" if rows else
+                                 "No stored HTTPS tokens found. Save one from the HTTPS window.")
+
+            _post_ui(apply_rows)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _selected():
+        sel = tree.selection()
+        return sel[0] if sel else ""
+
+    def _use():
+        host = _selected()
+        if not host:
+            return
+        auth_pat_host_var.set(host)
+        usr, _ = _https_token_stored(host)
+        auth_pat_user_var.set(usr or _pat_default_username(host))
+        auth_pat_status_var.set(f"A token is stored for {usr or '?'}@{host}.")
+        win.destroy()
+
+    def _remove():
+        host = _selected()
+        if not host:
+            return
+        if not messagebox.askyesno("Stored HTTPS Tokens",
+                                   f"Remove the stored token for {host}?", parent=win):
+            return
+        usr, _ = _https_token_stored(host)
+        _run_git_credential("reject", host, usr or "")
+        _pat_registry_remove(host)
+        _refresh()
+
+    btns = tk.Frame(frm)
+    btns.pack(pady=(10, 0))
+    tk.Button(btns, text="Use in form", command=_use, width=13).grid(row=0, column=0, padx=5)
+    tk.Button(btns, text="Remove", command=_remove, width=11).grid(row=0, column=1, padx=5)
+    tk.Button(btns, text="Refresh", command=_refresh, width=11).grid(row=0, column=2, padx=5)
+    tk.Button(btns, text="Close", command=win.destroy, width=10).grid(row=0, column=3, padx=5)
+
+    _refresh()
+    win.focus_set()
+
+
+def open_https_auth_window():
+    """HTTPS Personal Access Token configuration in its own window."""
+    win = _singleton_auth_window("https", "HTTPS Authentication", "560x470")
+    if win is None:
+        return
+
+    frm = tk.Frame(win, padx=20, pady=18)
+    frm.pack(fill="both", expand=True)
+
+    tk.Label(frm, text="HTTPS Access Token", font=("Arial", 13, "bold")).pack(pady=(0, 4))
+    tk.Label(
+        frm,
+        text="Saved in your OS credential helper (Git Credential Manager / Keychain / "
+             "libsecret).\nOnce saved, HTTPS clone / fetch / push authenticate "
+             "automatically.\n\n"
+             "GitLab username: oauth2       GitHub username: x-access-token (any value works)\n"
+             "Bitbucket: your real account username.",
+        font=("Arial", 8), justify="center", fg="#555").pack(pady=(0, 12))
+
+    host_frame = tk.Frame(frm); host_frame.pack(pady=4)
+    tk.Label(host_frame, text="Host:", width=10, anchor="e").grid(row=0, column=0, padx=5)
+    tk.Entry(host_frame, textvariable=auth_pat_host_var, width=38).grid(row=0, column=1)
+
+    user_frame = tk.Frame(frm); user_frame.pack(pady=4)
+    tk.Label(user_frame, text="Username:", width=10, anchor="e").grid(row=0, column=0, padx=5)
+    tk.Entry(user_frame, textvariable=auth_pat_user_var, width=38).grid(row=0, column=1)
+
+    token_frame = tk.Frame(frm); token_frame.pack(pady=4)
+    tk.Label(token_frame, text="Token:", width=10, anchor="e").grid(row=0, column=0, padx=5)
+    token_entry = tk.Entry(token_frame, textvariable=auth_pat_token_var, width=38, show="*")
+    token_entry.grid(row=0, column=1)
+    show_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(
+        token_frame, text="show", variable=show_var,
+        command=lambda: token_entry.config(show="" if show_var.get() else "*"),
+    ).grid(row=0, column=2, padx=4)
+
+    btn_frame = tk.Frame(frm); btn_frame.pack(pady=(14, 4))
+    tk.Button(btn_frame, text="Save Token", command=_save_https_token, width=14).grid(row=0, column=0, padx=6)
+    tk.Button(btn_frame, text="Test Token", command=_test_https_token, width=14).grid(row=0, column=1, padx=6)
+    tk.Button(btn_frame, text="Remove Token", command=_remove_https_token, width=14).grid(row=0, column=2, padx=6)
+
+    tk.Label(frm, textvariable=auth_pat_status_var, font=("Arial", 8), fg="#0a6",
+             wraplength=480, justify="center").pack(pady=(6, 0))
+
+    tk.Button(frm, text="Show stored tokens…", command=open_stored_tokens_window).pack(pady=(12, 0))
+    tk.Button(frm, text="Close", command=win.destroy).pack(pady=(8, 0))
+
+    _prefill_pat_fields()
+    win.focus_set()
+
+
+def open_ssh_auth_window():
+    """SSH key management and the guided repo-connection steps in their own window."""
+    win = _singleton_auth_window("ssh", "SSH Authentication", "620x470")
+    if win is None:
+        return
+
+    frm = tk.Frame(win, padx=20, pady=18)
+    frm.pack(fill="both", expand=True)
+
+    tk.Label(frm, text="SSH keys", font=("Arial", 12, "bold")).pack(pady=(0, 4))
+    key_row = tk.Frame(frm); key_row.pack(pady=(0, 12))
+    tk.Button(key_row, text="Show Public Key", command=show_public_keys, width=20).grid(row=0, column=0, padx=8, pady=3)
+    tk.Button(key_row, text="Generate SSH Key", command=generate_ssh_key_help, width=20).grid(row=0, column=1, padx=8, pady=3)
+    tk.Button(key_row, text="Manage Server Keys", command=manage_server_keys, width=20).grid(row=1, column=0, padx=8, pady=3)
+
+    tk.Label(frm, text="Repository SSH connection  (run in order)",
+             font=("Arial", 12, "bold")).pack(pady=(8, 4))
+    conn = tk.Frame(frm); conn.pack(pady=(0, 4))
+    tk.Button(conn, text="1. Show Remote URLs", command=show_remote_urls, width=24).grid(row=0, column=0, padx=6, pady=3)
+    tk.Button(conn, text="2. Convert Origin to SSH", command=convert_origin_to_ssh, width=24).grid(row=0, column=1, padx=6, pady=3)
+    tk.Button(conn, text="3. Trust Server Host Key", command=trust_origin_host, width=24).grid(row=1, column=0, padx=6, pady=3)
+    tk.Button(conn, text="4. Test SSH to Server", command=test_origin_ssh_guided, width=24).grid(row=1, column=1, padx=6, pady=3)
+    tk.Button(conn, text="5. Verify with Fetch", command=verify_with_fetch, width=24).grid(row=2, column=0, padx=6, pady=3)
+
+    tk.Label(frm, text="Diagnostics", font=("Arial", 12, "bold")).pack(pady=(10, 4))
+    diag = tk.Frame(frm); diag.pack(pady=(0, 4))
+    tk.Button(diag, text="Show Active Key for This Repo", command=show_active_key_for_repo, width=28).grid(row=0, column=0, padx=6, pady=3)
+    tk.Button(diag, text="Check Git SSH Client", command=check_git_ssh_client, width=24).grid(row=0, column=1, padx=6, pady=3)
+
+    tk.Button(frm, text="Close", command=win.destroy).pack(pady=(16, 0))
+    win.focus_set()
+
 # --- helpers: current branch + origin URL + SSH/remote tools ---
 
 def _current_branch_name():
@@ -420,31 +1209,6 @@ def _parse_origin_host_and_path():
         path = path[:-4]
     return host, path
 
-def switch_origin_to_ssh_any():
-    """
-    Convert HTTPS -> SSH for ANY host:
-      https://HOST/GROUP/REPO(.git) -> git@HOST:GROUP/REPO.git
-    If already SSH, just inform.
-    """
-    r = _get_primary_remote()
-    if not r:
-        messagebox.showerror("Remote", "No remote found.")
-        return
-    url = r.url
-    if url.startswith("git@") and ":" in url:
-        messagebox.showinfo("Remote", f"Remote '{r.name}' is already SSH:\n{url}")
-        return
-    host, path = _parse_origin_host_and_path()
-    if not host or not path:
-        messagebox.showerror("Remote", f"Cannot parse remote URL:\n{url}")
-        return
-    ssh_url = f"git@{host}:{path}.git"
-    try:
-        r.set_url(ssh_url)
-        messagebox.showinfo("Remote", f"Switched '{r.name}' to SSH:\n{ssh_url}")
-    except Exception as e:
-        messagebox.showerror("Remote", f"Failed to switch remote:\n{e}")
-
 def _ssh_test_to_host(host: str):
     """Common ssh -T tester with accept-new fallback and trust prompt."""
     startupinfo = None
@@ -490,25 +1254,1010 @@ def _ssh_test_to_host(host: str):
 
     messagebox.showinfo(f"SSH Test ({host})", msg2 or "(no output)")
 
-def test_github_ssh():
-    """Test SSH auth to GitHub from the GUI (no terminal)."""
-    _ssh_test_to_host("github.com")
+def _default_ssh_dir() -> str:
+    """Default per-user SSH directory (~/.ssh) on Windows, macOS and Linux."""
+    return os.path.join(os.path.expanduser("~"), ".ssh")
 
-def test_gitlab_ssh():
-    """Test SSH auth to GitLab from the GUI (no terminal)."""
-    _ssh_test_to_host("gitlab.com")
 
-def test_origin_host_ssh():
-    """Test SSH to the host inferred from the primary remote (works for gitlab.* etc.)."""
+def show_public_keys():
+    """List every *.pub key in the user's default ~/.ssh directory in a table."""
+    ssh_dir = _default_ssh_dir()
+
+    pub_files = []
+    if os.path.isdir(ssh_dir):
+        try:
+            for name in sorted(os.listdir(ssh_dir)):
+                full = os.path.join(ssh_dir, name)
+                if name.lower().endswith(".pub") and os.path.isfile(full):
+                    try:
+                        with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                            content = fh.read().strip()
+                    except Exception as e:
+                        content = f"(could not read: {e})"
+                    pub_files.append((name, content))
+        except Exception as e:
+            messagebox.showerror("Public Keys", f"Could not read SSH directory:\n{ssh_dir}\n\n{e}")
+            return
+
+    if not pub_files:
+        want = messagebox.askyesno(
+            "Public Keys",
+            "There is no public/private key in this system.\n\n"
+            f"Looked in: {ssh_dir}"
+            + ("" if os.path.isdir(ssh_dir) else "\n(directory does not exist)")
+            + "\n\nTo generate a new key, use the \"Generate SSH Key\" button.\n"
+            "Open those instructions now?",
+        )
+        if want:
+            generate_ssh_key_help()
+        return
+
+    popup = Toplevel(root)
+    popup.title("SSH Public Keys")
+    popup.geometry("900x420")
+    popup.minsize(600, 300)
+    popup.transient(root)
+
+    popup.grid_rowconfigure(2, weight=1)
+    popup.grid_columnconfigure(0, weight=1)
+
+    tk.Label(popup, text="SSH Public Keys", font=("Arial", 12, "bold")).grid(
+        row=0, column=0, sticky="w", padx=10, pady=(10, 2)
+    )
+    tk.Label(popup, text=f".ssh directory:  {ssh_dir}", font=("Arial", 9)).grid(
+        row=1, column=0, sticky="w", padx=10, pady=(0, 6)
+    )
+
+    table_wrap = tk.Frame(popup)
+    table_wrap.grid(row=2, column=0, sticky="nsew", padx=10, pady=0)
+    table_wrap.grid_rowconfigure(0, weight=1)
+    table_wrap.grid_columnconfigure(0, weight=1)
+
+    cols = ("file_name", "public_key")
+    tree = ttk.Treeview(table_wrap, columns=cols, show="headings")
+    tree.heading("file_name", text="file_name")
+    tree.heading("public_key", text="public_key")
+    tree.column("file_name", width=160, minwidth=120, stretch=False, anchor="w")
+    tree.column("public_key", width=1400, minwidth=300, stretch=False, anchor="w")
+
+    vbar = ttk.Scrollbar(table_wrap, orient="vertical", command=tree.yview)
+    hbar = ttk.Scrollbar(table_wrap, orient="horizontal", command=tree.xview)
+    tree.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    vbar.grid(row=0, column=1, sticky="ns")
+    hbar.grid(row=1, column=0, sticky="ew")
+
+    for name, content in pub_files:
+        tree.insert("", "end", values=(name, content.replace("\n", " ")))
+
+    def _copy_selected():
+        sel = tree.selection()
+        if not sel:
+            return
+        key_text = tree.item(sel[0], "values")[1]
+        popup.clipboard_clear()
+        popup.clipboard_append(key_text)
+
+    btn_row = tk.Frame(popup)
+    btn_row.grid(row=3, column=0, sticky="e", padx=10, pady=8)
+    tk.Button(btn_row, text="Copy selected key", command=_copy_selected).pack(side="left", padx=4)
+    tk.Button(btn_row, text="Close", command=popup.destroy).pack(side="left", padx=4)
+
+
+def _best_identity_email() -> str:
+    """Best guess at the user's email for the ssh-keygen -C comment."""
+    try:
+        v = auth_email_var.get().strip()
+        if v:
+            return v
+    except Exception:
+        pass
+    try:
+        v = _git_global_get("user.email")
+        if v:
+            return v.strip()
+    except Exception:
+        pass
+    return "YOUR_EMAIL_ADDRESS"
+
+
+def generate_ssh_key_help():
+    """Show the ssh-keygen command (copyable) plus step-by-step instructions."""
+    ssh_dir = _default_ssh_dir()
+    email = _best_identity_email()
+    command = f'ssh-keygen -t ed25519 -C "{email}"'
+
+    popup = Toplevel(root)
+    popup.title("Generate SSH Key")
+    popup.geometry("680x460")
+    popup.minsize(560, 400)
+    popup.transient(root)
+    popup.grid_columnconfigure(0, weight=1)
+    popup.grid_rowconfigure(3, weight=1)
+
+    tk.Label(popup, text="Generate a new SSH key", font=("Arial", 12, "bold")).grid(
+        row=0, column=0, sticky="w", padx=12, pady=(12, 2)
+    )
+    tk.Label(popup, text="Run this command in your terminal:", font=("Arial", 9)).grid(
+        row=1, column=0, sticky="w", padx=12, pady=(4, 2)
+    )
+
+    cmd_row = tk.Frame(popup)
+    cmd_row.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 6))
+    cmd_row.grid_columnconfigure(0, weight=1)
+    cmd_entry = tk.Entry(cmd_row, font=("Consolas", 10))
+    cmd_entry.insert(0, command)
+    cmd_entry.configure(state="readonly")
+    cmd_entry.grid(row=0, column=0, sticky="ew", ipady=4)
+
+    def _copy_cmd():
+        popup.clipboard_clear()
+        popup.clipboard_append(command)
+        copy_btn.configure(text="Copied!")
+        popup.after(1200, lambda: copy_btn.configure(text="Copy command"))
+
+    copy_btn = tk.Button(cmd_row, text="Copy command", command=_copy_cmd)
+    copy_btn.grid(row=0, column=1, padx=(8, 0))
+
+    steps_before = (
+        "Steps\n"
+        "1. Open your default terminal.\n"
+        "   - On Windows, PowerShell is preferred (from our side).\n"
+        "   - On macOS / Linux, use the Terminal app.\n"
+        "2. Do NOT change any directory or path - just leave the terminal\n"
+        "   where it opens (your home folder).\n"
+        "3. Paste and run the command above.\n"
+        "4. Press Enter at every prompt to accept the defaults\n"
+        "   (default file location, and an empty passphrase if you prefer).\n"
+        "5. The key pair is created in:\n   "
+    )
+    steps_after = (
+        "\n   (private key: id_ed25519   |   public key: id_ed25519.pub)\n"
+        "6. Come back here and click \"Show Public Key\" - your new public\n"
+        "   key will be listed there, ready to copy into GitHub / GitLab.\n\n"
+        "Note: the -C value is just a label (usually your email). It does not\n"
+        "have to match anything and can be changed later."
+    )
+    txt = scrolledtext.ScrolledText(popup, wrap="word", font=("Arial", 9), height=12)
+    txt.grid(row=3, column=0, sticky="nsew", padx=12, pady=(4, 6))
+    txt.tag_configure(
+        "sshpath",
+        font=("Consolas", 9, "bold"),
+        background="#fff3b0",
+        foreground="#000000",
+    )
+    txt.insert("1.0", steps_before)
+    txt.insert("end", ssh_dir, "sshpath")
+    txt.insert("end", steps_after)
+    txt.configure(state="disabled")
+
+    tk.Button(popup, text="Close", command=popup.destroy).grid(
+        row=4, column=0, sticky="e", padx=12, pady=(0, 12)
+    )
+
+
+# =============== SSH config (~/.ssh/config) management ===============
+# The app owns ONLY the fenced region below. Anything outside the fence is
+# the user's and is never rewritten. Each managed Host block maps one GitLab
+# server to one private key, with IdentitiesOnly so SSH uses exactly that key.
+
+SSH_CFG_FENCE_START = "# >>> insightsnet-gitrepo-manager >>>"
+SSH_CFG_FENCE_END = "# <<< insightsnet-gitrepo-manager <<<"
+
+
+def _ssh_config_path() -> str:
+    return os.path.join(_default_ssh_dir(), "config")
+
+
+def _ensure_ssh_dir() -> str:
+    """Create ~/.ssh (0700 on POSIX) if missing; return its path."""
+    d = _default_ssh_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+        if not sys.platform.startswith("win"):
+            os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return d
+
+
+def _read_ssh_config_parts():
+    """Split ~/.ssh/config into (before, managed_body, after) around the fence.
+
+    managed_body is the text between the two fence markers (markers excluded).
+    No file, or a missing/broken fence -> ("<all text>", "", "").
+    """
+    path = _ssh_config_path()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return "", "", ""
+
+    start = text.find(SSH_CFG_FENCE_START)
+    if start == -1:
+        return text, "", ""
+    end = text.find(SSH_CFG_FENCE_END, start)
+    if end == -1:
+        return text, "", ""
+    before = text[:start]
+    managed = text[start + len(SSH_CFG_FENCE_START):end]
+    after = text[end + len(SSH_CFG_FENCE_END):]
+    return before, managed.strip("\n"), after
+
+
+def _parse_host_blocks(body: str) -> list[dict]:
+    """Parse `Host` blocks out of SSH-config text."""
+    hosts: list[dict] = []
+    cur = None
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, val = line.partition(" ")
+        val = val.strip()
+        if val.startswith("="):
+            val = val[1:].strip()
+        kl = key.lower()
+        if kl == "host":
+            if cur:
+                hosts.append(cur)
+            cur = {"host": val, "hostname": "", "user": "",
+                   "identityfile": "", "identitiesonly": ""}
+        elif cur is not None:
+            if kl in cur:
+                cur[kl] = val
+    if cur:
+        hosts.append(cur)
+    return hosts
+
+
+def _managed_hosts() -> list[dict]:
+    """Host blocks inside the app-managed fence."""
+    _, body, _ = _read_ssh_config_parts()
+    return _parse_host_blocks(body)
+
+
+def _unmanaged_host_conflict(host: str) -> bool:
+    """True if `host` has a Host block OUTSIDE the managed fence."""
+    before, _, after = _read_ssh_config_parts()
+    outside = _parse_host_blocks(before + "\n" + after)
+    return any(h["host"] == host for h in outside)
+
+
+def _identity_for_host(host: str) -> str:
+    """IdentityFile mapped to `host` in the managed fence, or ''."""
+    for h in _managed_hosts():
+        if h["host"] == host:
+            return h.get("identityfile", "")
+    return ""
+
+
+def _render_host_block(h: dict) -> str:
+    return "\n".join([
+        f"Host {h['host']}",
+        f"    HostName {h.get('hostname') or h['host']}",
+        f"    User {h.get('user') or 'git'}",
+        f"    IdentityFile {h['identityfile']}",
+        "    IdentitiesOnly yes",
+    ])
+
+
+def _render_managed_block(hosts: list[dict]) -> str:
+    inner = "\n\n".join(_render_host_block(h) for h in hosts)
+    return (
+        f"{SSH_CFG_FENCE_START}\n"
+        "# Managed automatically by InsightsNet GitRepo Manager.\n"
+        "# Edit these entries from the app's SSH keys section, not by hand.\n"
+        + (inner + "\n" if inner else "")
+        + f"{SSH_CFG_FENCE_END}\n"
+    )
+
+
+def _backup_ssh_config() -> str | None:
+    """Copy config -> config.bak-<timestamp>; return backup path or None."""
+    path = _ssh_config_path()
+    if not os.path.isfile(path):
+        return None
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    dst = f"{path}.bak-{stamp}"
+    n = 1
+    while os.path.exists(dst):
+        dst = f"{path}.bak-{stamp}-{n}"
+        n += 1
+    try:
+        shutil.copyfile(path, dst)
+        return dst
+    except OSError:
+        return None
+
+
+def _write_managed_hosts(hosts: list[dict]) -> str | None:
+    """Rewrite the managed fence with `hosts` (backup first). Returns backup path."""
+    _ensure_ssh_dir()
+    before, _, after = _read_ssh_config_parts()
+    backup = _backup_ssh_config()
+
+    before = before.rstrip("\n")
+    after = after.lstrip("\n")
+    chunks = []
+    if before:
+        chunks.append(before + "\n\n")
+    chunks.append(_render_managed_block(hosts))
+    if after:
+        chunks.append("\n" + after)
+    new_text = "".join(chunks)
+    if not new_text.endswith("\n"):
+        new_text += "\n"
+
+    path = _ssh_config_path()
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(new_text)
+    os.replace(tmp, path)
+    if not sys.platform.startswith("win"):
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    return backup
+
+
+def _set_host_identity(host: str, identity_path: str) -> str | None:
+    """Add/update one managed Host block; returns backup path."""
+    hosts = _managed_hosts()
+    for h in hosts:
+        if h["host"] == host:
+            h["identityfile"] = identity_path
+            h["hostname"] = h.get("hostname") or host
+            h["user"] = h.get("user") or "git"
+            break
+    else:
+        hosts.append({"host": host, "hostname": host, "user": "git",
+                      "identityfile": identity_path, "identitiesonly": "yes"})
+    return _write_managed_hosts(hosts)
+
+
+def _remove_host_identity(host: str) -> str | None:
+    """Drop one managed Host block; returns backup path."""
+    hosts = [h for h in _managed_hosts() if h["host"] != host]
+    return _write_managed_hosts(hosts)
+
+
+def _list_private_keys() -> list[str]:
+    """Basenames in ~/.ssh that have a matching .pub sibling (i.e. real key pairs)."""
+    d = _default_ssh_dir()
+    out = []
+    if os.path.isdir(d):
+        for name in sorted(os.listdir(d)):
+            if name.endswith(".pub"):
+                base = name[:-4]
+                if os.path.isfile(os.path.join(d, base)):
+                    out.append(base)
+    return out
+
+
+def _suggest_key_name(host: str) -> str:
+    """gitlab.dlr.de -> id_ed25519_dlr ; gitlab.uni-rostock.de -> id_ed25519_uni_rostock."""
+    parts = [p for p in host.split(".") if p and p not in ("gitlab", "www")]
+    slug = parts[0] if parts else host
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", slug).strip("_").lower() or "key"
+    return f"id_ed25519_{slug}"
+
+
+def _tilde_path(abspath: str) -> str:
+    """Rewrite a path under the home dir back to ~/... (forward slashes) for config."""
+    home = os.path.expanduser("~")
+    try:
+        if os.path.commonpath([os.path.abspath(abspath), home]) == home:
+            rel = os.path.relpath(os.path.abspath(abspath), home).replace("\\", "/")
+            return f"~/{rel}"
+    except ValueError:
+        pass
+    return abspath.replace("\\", "/")
+
+
+def _win_startupinfo():
+    if sys.platform.startswith("win"):
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        return si
+    return None
+
+
+def _expand_key_path(p: str) -> str:
+    """Expand ~ and env vars in a config IdentityFile value to an absolute path."""
+    return os.path.abspath(os.path.expanduser(os.path.expandvars(p or "")))
+
+
+def _run_ssh_keygen(key_path: str, email: str):
+    """Create an ed25519 key pair non-interactively. Returns (ok, message)."""
+    try:
+        res = subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-f", key_path, "-N", "", "-C", email or ""],
+            text=True, capture_output=True, startupinfo=_win_startupinfo(),
+        )
+        return res.returncode == 0, ((res.stdout or "") + (res.stderr or "")).strip()
+    except FileNotFoundError:
+        return False, "ssh-keygen not found. Install the OpenSSH client and retry."
+    except Exception as e:
+        return False, f"Failed to run ssh-keygen: {e}"
+
+
+def _read_pub_for_identity(identityfile: str) -> str:
+    """Return the contents of <identityfile>.pub, or '' if not readable."""
+    p = _expand_key_path(identityfile) + ".pub"
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _origin_host_or_blank() -> str:
+    host, _ = _parse_origin_host_and_path()
+    return host or ""
+
+
+def manage_server_keys():
+    """View / edit the per-GitLab-server SSH identity mappings in ~/.ssh/config."""
+    popup = Toplevel(root)
+    popup.title("Manage Server Keys")
+    popup.geometry("820x460")
+    popup.minsize(680, 360)
+    popup.transient(root)
+    popup.grid_columnconfigure(0, weight=1)
+    popup.grid_rowconfigure(2, weight=1)
+
+    tk.Label(popup, text="Per-server SSH identities", font=("Arial", 12, "bold")).grid(
+        row=0, column=0, sticky="w", padx=12, pady=(12, 2)
+    )
+    path_lbl = tk.Label(popup, text="", font=("Arial", 9), fg="#444")
+    path_lbl.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 6))
+
+    table_wrap = tk.Frame(popup)
+    table_wrap.grid(row=2, column=0, sticky="nsew", padx=12)
+    table_wrap.grid_rowconfigure(0, weight=1)
+    table_wrap.grid_columnconfigure(0, weight=1)
+
+    cols = ("host", "key", "pub", "status")
+    tree = ttk.Treeview(table_wrap, columns=cols, show="headings", selectmode="browse")
+    for c, t, w in (("host", "GitLab server", 220), ("key", "Key file", 240),
+                    ("pub", ".pub?", 70), ("status", "Status", 180)):
+        tree.heading(c, text=t)
+        tree.column(c, width=w, anchor="w", stretch=(c == "status"))
+    vbar = ttk.Scrollbar(table_wrap, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=vbar.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    vbar.grid(row=0, column=1, sticky="ns")
+
+    active_lbl = tk.Label(popup, text="", font=("Arial", 9), justify="left")
+    active_lbl.grid(row=3, column=0, sticky="w", padx=12, pady=(8, 2))
+
+    def _refresh():
+        tree.delete(*tree.get_children())
+        path_lbl.config(text=f"~/.ssh/config :  {_ssh_config_path()}")
+        for h in _managed_hosts():
+            ident = h.get("identityfile", "")
+            has_pub = os.path.isfile(_expand_key_path(ident) + ".pub") if ident else False
+            has_priv = os.path.isfile(_expand_key_path(ident)) if ident else False
+            if not ident:
+                status = "no key set"
+            elif not has_priv:
+                status = "private key missing"
+            elif not has_pub:
+                status = "key present, .pub missing"
+            else:
+                status = "OK"
+            tree.insert("", "end", iid=h["host"],
+                        values=(h["host"], os.path.basename(ident) or "(none)",
+                                "yes" if has_pub else "no", status))
+        oh = _origin_host_or_blank()
+        if oh:
+            ident = _identity_for_host(oh)
+            if ident:
+                active_lbl.config(
+                    text=f"Loaded repo host: {oh}\nActive key: {ident}", fg="#0a0")
+            else:
+                active_lbl.config(
+                    text=f"Loaded repo host: {oh}\nNo key mapped for this server yet "
+                         f"— select it below (or Add mapping) to set one.", fg="#a60")
+            if oh in tree.get_children():
+                tree.selection_set(oh)
+        else:
+            active_lbl.config(text="No repo loaded (or remote is not recognised).", fg="#666")
+
+    def _selected_host():
+        sel = tree.selection()
+        return sel[0] if sel else ""
+
+    def _open_editor(host_prefill=""):
+        _key_mapping_editor(popup, host_prefill, _refresh)
+
+    def _remove():
+        host = _selected_host()
+        if not host:
+            return
+        if not messagebox.askyesno(
+            "Remove mapping",
+            f"Remove the managed SSH config block for:\n\n{host}\n\n"
+            "The key files on disk are NOT deleted.", parent=popup):
+            return
+        try:
+            bak = _remove_host_identity(host)
+            _refresh()
+            messagebox.showinfo("Removed", f"Removed {host}."
+                                + (f"\nBackup: {bak}" if bak else ""), parent=popup)
+        except Exception as e:
+            messagebox.showerror("Error", str(e), parent=popup)
+
+    def _test():
+        host = _selected_host()
+        if host:
+            _ssh_test_to_host(host)
+
+    def _show_pub():
+        host = _selected_host()
+        if not host:
+            return
+        ident = _identity_for_host(host)
+        pub = _read_pub_for_identity(ident)
+        if not pub:
+            messagebox.showinfo("Public key", f"No .pub found for:\n{ident}", parent=popup)
+            return
+        w = Toplevel(popup)
+        w.title(f"{host} — public key")
+        w.geometry("760x200")
+        w.transient(popup)
+        tk.Label(w, text=f"{os.path.basename(ident)}.pub  —  paste into "
+                 f"https://{host}/-/user_settings/ssh_keys", font=("Arial", 9)).pack(
+            anchor="w", padx=10, pady=(10, 4))
+        t = scrolledtext.ScrolledText(w, wrap="word", height=5, font=("Consolas", 9))
+        t.pack(fill="both", expand=True, padx=10, pady=4)
+        t.insert("1.0", pub)
+        t.configure(state="disabled")
+        def _copy():
+            w.clipboard_clear(); w.clipboard_append(pub)
+        tk.Button(w, text="Copy", command=_copy).pack(side="left", padx=10, pady=8)
+        tk.Button(w, text="Close", command=w.destroy).pack(side="left", pady=8)
+
+    btn_row = tk.Frame(popup)
+    btn_row.grid(row=4, column=0, sticky="w", padx=12, pady=10)
+    tk.Button(btn_row, text="Add mapping", command=lambda: _open_editor(_origin_host_or_blank())).pack(side="left", padx=4)
+    tk.Button(btn_row, text="Edit selected", command=lambda: _open_editor(_selected_host())).pack(side="left", padx=4)
+    tk.Button(btn_row, text="Remove", command=_remove).pack(side="left", padx=4)
+    tk.Button(btn_row, text="Test selected", command=_test).pack(side="left", padx=4)
+    tk.Button(btn_row, text="Show .pub", command=_show_pub).pack(side="left", padx=4)
+    tk.Button(btn_row, text="Close", command=popup.destroy).pack(side="left", padx=4)
+
+    _refresh()
+
+
+def _key_mapping_editor(parent, host_prefill, on_done):
+    """Sub-dialog: choose (or generate) the key for one GitLab server."""
+    win = Toplevel(parent)
+    win.title("Add / edit mapping")
+    win.geometry("560x360")
+    win.transient(parent)
+    win.grab_set()
+    win.grid_columnconfigure(0, weight=1)
+
+    tk.Label(win, text="GitLab server — hostname or any URL from it:", font=("Arial", 9)).grid(
+        row=0, column=0, sticky="w", padx=12, pady=(14, 2))
+    host_var = tk.StringVar(value=host_prefill or "")
+    host_entry = tk.Entry(win, textvariable=host_var, font=("Consolas", 10))
+    host_entry.grid(row=1, column=0, sticky="ew", padx=12)
+
+    def _normalize_host(*_):
+        raw = host_var.get()
+        h = _host_from_any(raw)
+        if h and h != raw:
+            host_var.set(h)
+    host_entry.bind("<FocusOut>", _normalize_host)
+
+    tk.Label(win, text="Key to use for this server:", font=("Arial", 9)).grid(
+        row=2, column=0, sticky="w", padx=12, pady=(14, 2))
+
+    keys = _list_private_keys()
+    existing = _identity_for_host(host_prefill) if host_prefill else ""
+    existing_base = os.path.basename(existing) if existing else ""
+    key_var = tk.StringVar(value=existing_base if existing_base in keys
+                           else (keys[0] if keys else "__new__"))
+
+    radio_wrap = tk.Frame(win)
+    radio_wrap.grid(row=3, column=0, sticky="w", padx=12)
+
+    def _sync_newname_enabled(*_):
+        state = "normal" if key_var.get() == "__new__" else "disabled"
+        newname_entry.config(state=state)
+        newname_lbl.config(fg="#000" if state == "normal" else "#999")
+
+    for k in keys:
+        tk.Radiobutton(radio_wrap, text=k, value=k, variable=key_var,
+                       command=_sync_newname_enabled).pack(anchor="w")
+    tk.Radiobutton(radio_wrap, text="Generate a new key…", value="__new__",
+                   variable=key_var, command=_sync_newname_enabled).pack(anchor="w")
+
+    newname_frame = tk.Frame(win)
+    newname_frame.grid(row=4, column=0, sticky="ew", padx=12, pady=(6, 0))
+    newname_lbl = tk.Label(newname_frame, text="New key file name:", font=("Arial", 9))
+    newname_lbl.pack(side="left")
+    newname_var = tk.StringVar(value=_suggest_key_name(host_prefill) if host_prefill else "id_ed25519_key")
+    newname_entry = tk.Entry(newname_frame, textvariable=newname_var, font=("Consolas", 10), width=28)
+    newname_entry.pack(side="left", padx=6)
+
+    _newname_touched = {"v": False}
+    def _mark_touched(*_):
+        _newname_touched["v"] = True
+    newname_entry.bind("<KeyRelease>", _mark_touched)
+
+    def _sync_newname(*_):
+        if not _newname_touched["v"]:
+            h = _host_from_any(host_var.get())
+            if h:
+                newname_var.set(_suggest_key_name(h))
+    host_var.trace_add("write", _sync_newname)
+    _sync_newname_enabled()
+
+    status = tk.Label(win, text="", font=("Arial", 9), fg="#a60", wraplength=520, justify="left")
+    status.grid(row=5, column=0, sticky="w", padx=12, pady=(10, 0))
+
+    def _save():
+        host = _host_from_any(host_var.get())
+        host_var.set(host)
+        if not host or " " in host or "/" in host or "." not in host:
+            status.config(text="Enter a hostname or a URL, e.g. gitlab.dlr.de")
+            return
+        if _unmanaged_host_conflict(host):
+            status.config(text=f"'{host}' is already configured manually in ~/.ssh/config "
+                               "(outside the managed section). Resolve that entry first.")
+            return
+
+        choice = key_var.get()
+        ssh_dir = _default_ssh_dir()
+        if choice == "__new__":
+            name = newname_var.get().strip()
+            if not name:
+                status.config(text="Enter a file name for the new key.")
+                return
+            key_path = os.path.join(ssh_dir, name)
+            if os.path.exists(key_path) or os.path.exists(key_path + ".pub"):
+                status.config(text=f"{name} already exists in ~/.ssh — pick another name.")
+                return
+            _ensure_ssh_dir()
+            ok, msg = _run_ssh_keygen(key_path, _best_identity_email())
+            if not ok:
+                messagebox.showerror("ssh-keygen failed", msg, parent=win)
+                return
+            identity = _tilde_path(key_path)
+        else:
+            key_path = os.path.join(ssh_dir, choice)
+            identity = _tilde_path(key_path)
+
+        try:
+            bak = _set_host_identity(host, identity)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not write ~/.ssh/config:\n{e}", parent=win)
+            return
+
+        pub = _read_pub_for_identity(identity)
+        win.destroy()
+        on_done()
+        info = (f"Mapped {host}  →  {identity}\n"
+                + (f"Backup: {bak}\n" if bak else "")
+                + ("\nAdd this public key to the server "
+                   f"(https://{host}/-/user_settings/ssh_keys):\n\n{pub}" if pub else ""))
+        messagebox.showinfo("Mapping saved", info, parent=parent)
+
+    btns = tk.Frame(win)
+    btns.grid(row=6, column=0, sticky="e", padx=12, pady=14)
+    tk.Button(btns, text="Cancel", command=win.destroy).pack(side="right", padx=4)
+    tk.Button(btns, text="Save", command=_save).pack(side="right", padx=4)
+
+
+# =============== SSH host-key trust (fingerprint prompt in the GUI) ===============
+
+def _host_from_any(text: str) -> str:
+    """Pull a bare hostname out of a URL, an ssh remote, or a plain host string."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    m = re.match(r'^[a-zA-Z][a-zA-Z0-9+.\-]*://', t)
+    if m:
+        try:
+            return (urlparse(t).hostname or "").strip()
+        except ValueError:
+            return ""
+    m = re.match(r'^(?:[^@/\s]+@)?(?P<host>[^:/\s]+)[:/]', t)
+    if m:
+        return m.group("host")
+    return t.split("/")[0].split(":")[0]
+
+
+def _known_hosts_path() -> str:
+    return os.path.join(_default_ssh_dir(), "known_hosts")
+
+
+def _host_in_known_hosts(host: str) -> bool:
+    try:
+        res = subprocess.run(
+            ["ssh-keygen", "-F", host],
+            text=True, capture_output=True, startupinfo=_win_startupinfo(),
+        )
+        return res.returncode == 0 and bool(res.stdout.strip())
+    except Exception:
+        return False
+
+
+def _scan_host_keys(host: str):
+    """Return (keyscan_lines, fingerprint_text) for `host`, or ('', '') on failure."""
+    try:
+        scan = subprocess.run(
+            ["ssh-keyscan", "-T", "10", "-t", "ed25519,rsa,ecdsa", host],
+            text=True, capture_output=True, startupinfo=_win_startupinfo(),
+        )
+    except FileNotFoundError:
+        return "", "(ssh-keyscan not found)"
+    except Exception as e:
+        return "", f"(ssh-keyscan failed: {e})"
+
+    lines = "\n".join(l for l in (scan.stdout or "").splitlines() if l and not l.startswith("#"))
+    if not lines:
+        return "", "(no host key returned)"
+
+    try:
+        fp = subprocess.run(
+            ["ssh-keygen", "-l", "-f", "-"],
+            input=lines + "\n", text=True, capture_output=True,
+            startupinfo=_win_startupinfo(),
+        )
+        return lines, (fp.stdout or "").strip() or "(could not compute fingerprint)"
+    except Exception as e:
+        return lines, f"(could not compute fingerprint: {e})"
+
+
+def _ensure_host_key_trusted(host: str, parent=None) -> bool:
+    """If `host` is not in known_hosts, show its fingerprint and ask to trust it.
+
+    Returns True if the host is trusted (already, or after the user accepts),
+    False if it could not be fetched or the user declined.
+    """
+    host = _host_from_any(host)
+    if not host:
+        return False
+    if _host_in_known_hosts(host):
+        return True
+
+    lines, fp = _scan_host_keys(host)
+    if not lines:
+        messagebox.showerror(
+            "Host key", f"Could not retrieve the host key for {host}.\n\n{fp}",
+            parent=parent or root)
+        return False
+
+    trust = messagebox.askyesno(
+        f"Unknown host key — {host}",
+        f"The authenticity of host '{host}' can't be established.\n\n"
+        f"Fingerprint(s):\n{fp}\n\n"
+        f"Verify this matches the value published by your GitLab admin\n"
+        f"( https://{host}/help/instance_configuration ).\n\n"
+        "Trust this host and add it to ~/.ssh/known_hosts?",
+        parent=parent or root,
+    )
+    if not trust:
+        return False
+
+    try:
+        _ensure_ssh_dir()
+        kh = _known_hosts_path()
+        existing = ""
+        if os.path.isfile(kh):
+            with open(kh, "r", encoding="utf-8", errors="replace") as fh:
+                existing = fh.read()
+        with open(kh, "a", encoding="utf-8", newline="\n") as fh:
+            if existing and not existing.endswith("\n"):
+                fh.write("\n")
+            fh.write(lines + "\n")
+        if not sys.platform.startswith("win"):
+            try:
+                os.chmod(kh, 0o600)
+            except OSError:
+                pass
+    except OSError as e:
+        messagebox.showerror("Host key", f"Could not write known_hosts:\n{e}",
+                             parent=parent or root)
+        return False
+    return True
+
+
+# =============== Repository SSH connection strip (one action per button) ===============
+
+def _ssh_auth_probe(host: str):
+    """Non-interactive `ssh -T git@host`. Returns (authenticated, message)."""
+    try:
+        res = subprocess.run(
+            ["ssh", "-T", "-o", "StrictHostKeyChecking=accept-new",
+             "-o", "BatchMode=yes", f"git@{host}"],
+            text=True, capture_output=True, startupinfo=_win_startupinfo(),
+        )
+        msg = ((res.stdout or "") + (res.stderr or "")).strip()
+        low = msg.lower()
+        ok = ("welcome to gitlab" in low
+              or "successfully authenticated" in low
+              or "does not provide shell access" in low)
+        return ok, msg or "(no output)"
+    except FileNotFoundError:
+        return False, "ssh not found. Install the OpenSSH client."
+    except Exception as e:
+        return False, f"Failed to run ssh: {e}"
+
+
+def show_remote_urls():
+    """Step 1: git remote -v, plus a verdict on what to do next."""
+    if not repo:
+        messagebox.showinfo("Remote URLs", "No repository loaded.")
+        return
+    try:
+        out = repo.git.remote("-v").strip()
+    except Exception as e:
+        messagebox.showerror("Remote URLs", f"git remote -v failed:\n{e}")
+        return
+    if not out:
+        messagebox.showinfo("Remote URLs",
+                            "This repository has no remotes — nothing to connect over SSH.")
+        return
+    r = _get_primary_remote()
+    url = r.url if r else ""
+    if url.startswith("git@") or url.startswith("ssh://"):
+        verdict = 'origin is already SSH.\nNext: click "Trust Server Host Key".'
+    elif url.startswith("http://") or url.startswith("https://"):
+        verdict = 'origin is HTTPS.\nNext: click "Convert Origin to SSH".'
+    else:
+        verdict = "Could not classify the origin URL."
+    messagebox.showinfo("git remote -v", f"{out}\n\n{'-' * 44}\n{verdict}")
+
+
+def convert_origin_to_ssh():
+    """Step 2: rewrite ONLY the primary remote from HTTPS to git@host:path."""
     r = _get_primary_remote()
     if not r:
-        messagebox.showerror("SSH Test", "No remote found in this repository.")
+        messagebox.showerror("Convert Origin to SSH",
+                             "No remote found. Load a repository with a remote first.")
         return
+    url = r.url
+    if url.startswith("git@") or url.startswith("ssh://"):
+        messagebox.showinfo("Convert Origin to SSH",
+                            f"'{r.name}' is already SSH:\n{url}\n\n"
+                            'Nothing to do.\nNext: click "Trust Server Host Key".')
+        return
+    host, path = _parse_origin_host_and_path()
+    if not host or not path:
+        messagebox.showerror("Convert Origin to SSH", f"Cannot parse the URL:\n{url}")
+        return
+    ssh_url = f"git@{host}:{path}.git"
+    if not messagebox.askyesno(
+        "Convert Origin to SSH",
+        f"Change the '{r.name}' remote URL\n\nfrom:  {url}\nto:    {ssh_url}\n\nProceed?"):
+        return
+    try:
+        r.set_url(ssh_url)
+    except Exception as e:
+        messagebox.showerror("Convert Origin to SSH", f"Failed:\n{e}")
+        return
+    messagebox.showinfo("Convert Origin to SSH",
+                        f"'{r.name}' is now SSH:\n{ssh_url}\n\n"
+                        'Next: click "Trust Server Host Key".')
+
+
+def trust_origin_host():
+    """Step 3: add the origin host's key to known_hosts (fingerprint prompt in-app)."""
     host, _ = _parse_origin_host_and_path()
     if not host:
-        messagebox.showerror("SSH Test", f"Could not determine host from remote '{r.name}' URL:\n{r.url}")
+        messagebox.showerror("Trust Server Host Key",
+                             "No repository / remote host found.")
         return
-    _ssh_test_to_host(host)
+    if _host_in_known_hosts(host):
+        messagebox.showinfo("Trust Server Host Key",
+                            f"{host} is already in ~/.ssh/known_hosts.\n\n"
+                            'Next: click "Test SSH to Server".')
+        return
+    if _ensure_host_key_trusted(host):
+        messagebox.showinfo("Trust Server Host Key",
+                            f"{host} added to ~/.ssh/known_hosts.\n\n"
+                            'Next: click "Test SSH to Server".')
+
+
+def test_origin_ssh_guided():
+    """Step 4: ssh -T to the origin host, with a verdict and next step."""
+    host, _ = _parse_origin_host_and_path()
+    if not host:
+        messagebox.showerror("Test SSH to Server", "No repository / remote host found.")
+        return
+    if not _ensure_host_key_trusted(host):
+        return
+    ok, msg = _ssh_auth_probe(host)
+    if ok:
+        messagebox.showinfo("Test SSH to Server",
+                            f"{msg}\n\n{'-' * 44}\nAuthentication works.\n"
+                            'Next: click "Verify with Fetch".')
+    else:
+        ident = _identity_for_host(host) or "(no key mapped)"
+        messagebox.showwarning(
+            "Test SSH to Server",
+            f"{msg}\n\n{'-' * 44}\nSSH did not authenticate.\n\n"
+            f"Key mapped for {host}:  {ident}\n\n"
+            "Check:\n"
+            f"  - the .pub is added at https://{host}/-/user_settings/ssh_keys\n"
+            '  - the right key is mapped (open "Manage Server Keys")')
+
+
+def verify_with_fetch():
+    """Step 5: git fetch on the primary remote to confirm end-to-end."""
+    r = _get_primary_remote()
+    if not r or not repo:
+        messagebox.showerror("Verify with Fetch", "No remote found.")
+        return
+    host, _ = _parse_origin_host_and_path()
+    if host and not _ensure_host_key_trusted(host):
+        return
+    try:
+        repo.git.fetch(r.name)
+    except Exception as e:
+        messagebox.showerror("Verify with Fetch",
+                             f"git fetch {r.name} failed:\n\n{e}\n\n"
+                             'If this is an auth error, re-check "Test SSH to Server".')
+        return
+    messagebox.showinfo("Verify with Fetch",
+                        f"git fetch {r.name} succeeded.\n\n"
+                        "SSH is fully working for this repository. Done.")
+
+
+def show_active_key_for_repo():
+    """Diagnostic: which managed key will SSH use for the loaded repo's host."""
+    host, _ = _parse_origin_host_and_path()
+    if not host:
+        messagebox.showinfo("Active Key for This Repo",
+                            "No repository / remote host found.")
+        return
+    ident = _identity_for_host(host)
+    if not ident:
+        messagebox.showinfo(
+            "Active Key for This Repo",
+            f"Remote host:  {host}\n\n"
+            "No key mapped in the managed section of ~/.ssh/config.\n"
+            'Open "Manage Server Keys" to set one.')
+        return
+    pub_ok = os.path.isfile(_expand_key_path(ident) + ".pub")
+    messagebox.showinfo(
+        "Active Key for This Repo",
+        f"Remote host:   {host}\n"
+        f"IdentityFile:  {ident}\n"
+        f".pub present:  {'yes' if pub_ok else 'no'}")
+
+
+def check_git_ssh_client():
+    """Diagnostic: is Git using OpenSSH (reads ~/.ssh/config) or plink (does not)."""
+    gs = os.environ.get("GIT_SSH", "")
+    gsc = os.environ.get("GIT_SSH_COMMAND", "")
+    try:
+        cfg = repo.git.config("--get", "core.sshCommand").strip() if repo else ""
+    except Exception:
+        cfg = ""
+    effective = gsc or cfg or gs or "ssh (default OpenSSH)"
+    low = effective.lower()
+    if "plink" in low or "putty" in low:
+        verdict = ("PuTTY/plink detected. plink does NOT read ~/.ssh/config, so the\n"
+                   "per-server key mappings will be ignored.\n"
+                   "Switch Git to OpenSSH:  set GIT_SSH_COMMAND=ssh  (or clear GIT_SSH).")
+    else:
+        verdict = "Looks like OpenSSH — ~/.ssh/config is used. Good."
+    messagebox.showinfo(
+        "Git SSH Client",
+        f"GIT_SSH          = {gs or '(unset)'}\n"
+        f"GIT_SSH_COMMAND  = {gsc or '(unset)'}\n"
+        f"core.sshCommand  = {cfg or '(unset)'}\n\n"
+        f"Effective:  {effective}\n\n{verdict}")
+
 
 def _parse_ssh_user_host(url: str):
     """Return (user, host, port) for SSH URLs; ("", "", None) if not SSH."""
@@ -631,45 +2380,6 @@ def _ensure_ssh_host_trusted(repo_url: str) -> bool:
 
     return True
 
-# ---- NEW: remote/branch diagnostics helpers ----
-
-def show_origin_refspec():
-    """Display current fetch refspec(s) for the primary remote."""
-    r = _get_primary_remote()
-    if not r:
-        messagebox.showinfo("Remote", "No remote configured.")
-        return
-    try:
-        out = repo.git.config('--get-all', f'remote.{r.name}.fetch')
-    except Exception:
-        out = f'(no {r.name} or no refspec)'
-    messagebox.showinfo(f"{r.name}.fetch refspec", out or '(empty)')
-
-def show_remote_heads():
-    """List branches available on the server for the primary remote."""
-    r = _get_primary_remote()
-    if not r:
-        messagebox.showinfo("Remote", "No remote configured.")
-        return
-    try:
-        out = repo.git.ls_remote('--heads', r.name)
-    except Exception as e:
-        out = f'ls-remote failed:\n{e}'
-    messagebox.showinfo(f"{r.name} heads", out or '(none)')
-
-def fix_refspec_and_fetch():
-    """Ensure we fetch all branches; then fetch --all --prune."""
-    r = _get_primary_remote()
-    if not r:
-        messagebox.showwarning("Remote", "No remote configured.")
-        return
-    try:
-        repo.git.config(f'remote.{r.name}.fetch', f'+refs/heads/*:refs/remotes/{r.name}/*')
-        repo.git.fetch('--all', '--prune')
-        messagebox.showinfo("Remote", "Refspec fixed and fetched.\nNow refresh branches.")
-    except Exception as e:
-        messagebox.showerror("Remote", f"Failed to fix refspec/fetch:\n{e}")
-
 def fetch_all_and_prune():
     """Convenience: fetch --all --prune and refresh the dropdown."""
     try:
@@ -752,7 +2462,17 @@ def clone_repo():
                 return
             download_button.config(state=tk.NORMAL)
             if not result["ok"]:
-                messagebox.showerror("Error", f"Failed to clone/load repo:\n{result['error']}")
+                err_text = str(result["error"])
+                low = err_text.lower()
+                hint = ""
+                if repo_url.startswith(("http://", "https://")) and any(
+                    s in low for s in ("authentication failed", "could not read username",
+                                       "could not read password", "invalid username or password",
+                                       "http 403", "403 forbidden", "terminal prompts disabled")):
+                    hint = ("\n\nThis looks like an HTTPS authentication failure. Open the "
+                            "'Git AuthN' tab -> HTTPS Access Token, save a Personal Access "
+                            "Token for this host, then clone again.")
+                messagebox.showerror("Error", f"Failed to clone/load repo:\n{err_text}{hint}")
                 return
 
             path = result["path"]
@@ -771,6 +2491,7 @@ def clone_repo():
             messagebox.showinfo(title, msg)
             list_branches(path)
             _prefill_auth_fields()
+            _prefill_pat_fields()
             _update_terminal_prompt()
             refresh_workflow_graph()
 
@@ -1347,11 +3068,10 @@ def _pre_commit_sync_if_needed() -> bool:
 
         try:
             counts = repo.git.rev_list("--left-right", "--count", f"{branch_name}...{upstream}").strip()
-            ahead_str, behind_str = (counts.split() + ["0", "0"])[:2]
-            ahead = int(ahead_str)
+            _ahead_str, behind_str = (counts.split() + ["0", "0"])[:2]
             behind = int(behind_str)
         except Exception:
-            ahead = behind = 0
+            behind = 0
 
         dirty = repo.is_dirty(untracked_files=True)
 
@@ -2600,8 +4320,30 @@ if sys.platform.startswith("linux"):
     except Exception:
         pass
 
-root.geometry("980x760")
+root.geometry("980x780")
 branch_var = tk.StringVar(root)
+
+# ---- Shared "Developed by Team InsightsNet" credit + hyperlink helpers ----
+INSIGHTSNET_URL = "https://insightsnet.org/"
+
+def _open_url(url):
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+def _hyperlink(parent, text, url, size=9):
+    lbl = tk.Label(parent, text=text, font=("Arial", size, "underline"),
+                   fg="#1a56db", cursor="hand2")
+    lbl.bind("<Button-1>", lambda _e: _open_url(url))
+    return lbl
+
+def _insightsnet_credit(parent, size=8, fg="#666"):
+    """A row: 'Developed by Team ' + clickable 'InsightsNet'."""
+    fr = tk.Frame(parent)
+    tk.Label(fr, text="Developed by Team ", font=("Arial", size), fg=fg).pack(side="left")
+    _hyperlink(fr, "InsightsNet", INSIGHTSNET_URL, size=size).pack(side="left")
+    return fr
 
 # Tabs
 notebook = ttk.Notebook(root)
@@ -2615,6 +4357,14 @@ notebook.add(main_tab,  text="Main")
 notebook.add(graph_tab, text="Workflow Graph")
 notebook.add(terminal_tab, text="Terminal")
 notebook.add(about_tab, text="About")
+
+# Global footer, shown under every tab (packed before the notebook so it keeps
+# its strip at the bottom of the window).
+_footer = tk.Frame(root)
+_footer.pack(side="bottom", fill="x")
+tk.Frame(_footer, height=1, bg="#cccccc").pack(fill="x")
+_insightsnet_credit(_footer, size=8).pack(pady=3)
+
 notebook.pack(fill="both", expand=True)
 
 # --- Scrollable container (Main)
@@ -2629,11 +4379,28 @@ scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=can
 canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
 canvas.configure(yscrollcommand=scrollbar.set)
 
+# Wheel events are bound app-wide (bind_all), so a single handler routes the
+# scroll to whichever tab's canvas is currently shown. Each scrollable tab
+# registers its canvas here keyed by the tab's widget path.
+_tab_canvases = {str(main_tab): canvas}
+
 def _on_mousewheel(event):
+    target = _tab_canvases.get(notebook.select())
+    if target is None:
+        return
+    # bind_all fires for the whole app, including pop-up windows layered over the
+    # tab. Only scroll when the pointer is actually over the target canvas (or a
+    # widget inside it), so wheeling inside a Toplevel doesn't move the tab behind.
+    try:
+        w = root.winfo_containing(event.x_root, event.y_root)
+    except Exception:
+        w = None
+    if w is None or (w is not target and str(target) not in str(w)):
+        return
     if event.num == 5 or event.delta < 0:
-        canvas.yview_scroll(1, "units")
+        target.yview_scroll(1, "units")
     elif event.num == 4 or event.delta > 0:
-        canvas.yview_scroll(-1, "units")
+        target.yview_scroll(-1, "units")
 
 canvas.bind_all("<MouseWheel>", _on_mousewheel)
 canvas.bind_all("<Button-4>", _on_mousewheel)
@@ -2866,7 +4633,7 @@ except Exception:
 
 def smart_pdf_name():
     base = "igrm_User_Guide"
-    ver = "v0.28"
+    ver = "v0.26"
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
     repo_name = ""
     try:
@@ -2904,13 +4671,35 @@ tk.Label(
 tk.Button(about_tab, text="Download User Guide (PDF)", command=download_pdf).pack(pady=10)
 tk.Label(
     about_tab,
-    text="-----------------------------------------\nInsightsNet GitRepo Manager\nVersion 0.28\nDeveloped by Team InsightsNet\n© 2026",
+    text="-----------------------------------------\nInsightsNet GitRepo Manager\nVersion 0.30\n© 2026",
     font=("Arial", 12),
-    pady=20
+    pady=(20)
 ).pack()
+_insightsnet_credit(about_tab, size=12, fg="#000").pack()
+_hyperlink(about_tab, INSIGHTSNET_URL, INSIGHTSNET_URL, size=10).pack(pady=(4, 20))
 
 # ---- Git AuthN Tab (UI + remote tools)
-auth_wrap = tk.LabelFrame(auth_tab, text="Authentication", padx=20, pady=20, font=("Arial", 12, "bold"))
+# Scrollable container so the whole tab is reachable without resizing the window.
+auth_outer = tk.Frame(auth_tab)
+auth_outer.pack(fill="both", expand=True)
+
+auth_canvas = tk.Canvas(auth_outer, highlightthickness=0)
+auth_scrollbar = tk.Scrollbar(auth_outer, orient="vertical", command=auth_canvas.yview)
+auth_scroll_frame = tk.Frame(auth_canvas)
+
+auth_scroll_frame.bind(
+    "<Configure>", lambda e: auth_canvas.configure(scrollregion=auth_canvas.bbox("all")))
+_auth_canvas_window = auth_canvas.create_window((0, 0), window=auth_scroll_frame, anchor="nw")
+# Keep the inner frame as wide as the canvas so content stays centred, not left-hugging.
+auth_canvas.bind(
+    "<Configure>", lambda e: auth_canvas.itemconfigure(_auth_canvas_window, width=e.width))
+auth_canvas.configure(yscrollcommand=auth_scrollbar.set)
+
+auth_canvas.pack(side="left", fill="both", expand=True)
+auth_scrollbar.pack(side="right", fill="y")
+_tab_canvases[str(auth_tab)] = auth_canvas
+
+auth_wrap = tk.LabelFrame(auth_scroll_frame, text="Authentication", padx=20, pady=20, font=("Arial", 12, "bold"))
 auth_wrap.pack(fill="both", expand=True, padx=20, pady=20)
 
 try:
@@ -2941,23 +4730,29 @@ apply_frame = tk.Frame(auth_wrap); apply_frame.pack(pady=14)
 tk.Button(apply_frame, text="Apply Loaded Repository", command=_apply_identity_repo, width=20).grid(row=0, column=0, padx=10)
 tk.Button(apply_frame, text="Apply Globally", command=_apply_identity_global, width=18).grid(row=0, column=1, padx=10)
 
-tk.Label(auth_wrap, text="Remote (origin) tools", font=("Arial", 11, "bold")).pack(pady=(18, 4))
-tk.Button(auth_wrap, text="Show Origin URL", command=lambda: messagebox.showinfo("Origin", get_origin_url() or "No origin"))\
-  .pack(pady=(0,4))
+# ---- Remote authentication: pick a method, configure it in its own window ----
+# StringVars live on the tab (created once) so the HTTPS helpers keep working even
+# while the HTTPS window is closed; the window just binds Entry widgets to them.
+auth_pat_host_var = tk.StringVar()
+auth_pat_user_var = tk.StringVar()
+auth_pat_token_var = tk.StringVar()
+auth_pat_status_var = tk.StringVar(value="")
 
-remote_row = tk.Frame(auth_wrap); remote_row.pack(pady=4)
-tk.Button(remote_row, text="Switch Origin to SSH", command=switch_origin_to_ssh_any, width=20).grid(row=0, column=0, padx=8)
-tk.Button(remote_row, text="Test GitHub SSH", command=test_github_ssh, width=20).grid(row=0, column=1, padx=8)
-tk.Button(remote_row, text="Test Origin Host SSH", command=test_origin_host_ssh, width=22).grid(row=0, column=2, padx=8)
-tk.Button(remote_row, text="Test GitLab SSH", command=test_gitlab_ssh, width=20).grid(row=0, column=3, padx=8)
+tk.Label(auth_wrap, text="Remote authentication", font=("Arial", 11, "bold")).pack(pady=(20, 2))
+tk.Label(
+    auth_wrap,
+    text="Choose how this machine authenticates to GitLab / GitHub, then configure it.",
+    font=("Arial", 9), fg="#555").pack(pady=(0, 12))
 
-diag_row = tk.Frame(auth_wrap); diag_row.pack(pady=4)
-tk.Button(diag_row, text="Show origin.fetch", width=20, command=show_origin_refspec).grid(row=0, column=0, padx=8)
-tk.Button(diag_row, text="Show Remote Heads", width=20, command=show_remote_heads).grid(row=0, column=1, padx=8)
-tk.Button(auth_wrap, text="Fix Refspec & Fetch All", command=fix_refspec_and_fetch).pack(pady=(6, 10))
+auth_method_row = tk.Frame(auth_wrap); auth_method_row.pack(pady=(0, 8))
+tk.Button(auth_method_row, text="HTTPS\n(Access Token)", command=open_https_auth_window,
+          width=20, height=3, font=("Arial", 10, "bold")).grid(row=0, column=0, padx=14)
+tk.Button(auth_method_row, text="SSH\n(Keys)", command=open_ssh_auth_window,
+          width=20, height=3, font=("Arial", 10, "bold")).grid(row=0, column=1, padx=14)
 
 # Prefill AuthN fields initially
 _prefill_auth_fields()
+_prefill_pat_fields()
 _update_terminal_prompt()
 _drain_ui_queue()
 
