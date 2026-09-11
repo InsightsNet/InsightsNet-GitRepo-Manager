@@ -11,6 +11,7 @@ import ctypes
 import threading
 import datetime
 import re
+import shlex
 import queue
 import tempfile
 import webbrowser
@@ -1210,7 +1211,20 @@ def _parse_origin_host_and_path():
     return host, path
 
 def _ssh_test_to_host(host: str):
-    """Common ssh -T tester with accept-new fallback and trust prompt."""
+    """Common ssh -T tester with accept-new fallback and trust prompt.
+
+    `host` may be a managed profile alias (ssh then reads its HostName / User /
+    IdentityFile), a bare hostname, or an explicit 'user@host'. With no explicit
+    user we use the login mapped for that server in ~/.ssh/config (default 'git').
+    """
+    _prof = next((h for h in _managed_hosts() if h["host"] == host), None)
+    if _prof:
+        target = _prof["host"]        # the alias; ssh_config supplies the rest
+        host = _profile_server(_prof)
+    else:
+        user, host = _split_user_host(host)
+        login = user or _login_for_host(host)
+        target = f"{login}@{host}"
     startupinfo = None
     if sys.platform.startswith("win"):
         startupinfo = subprocess.STARTUPINFO()
@@ -1231,13 +1245,13 @@ def _ssh_test_to_host(host: str):
             return 255, f"Failed to run ssh: {e}"
 
     # First try with StrictHostKeyChecking=accept-new (newer OpenSSH)
-    rc, msg = run_ssh(["ssh", "-T", "-o", "StrictHostKeyChecking=accept-new", f"git@{host}"])
+    rc, msg = run_ssh(["ssh", "-T", "-o", "StrictHostKeyChecking=accept-new", target])
     if rc != 255 or "unknown option -- o" not in msg.lower():
-        messagebox.showinfo(f"SSH Test ({host})", msg or "(no output)")
+        messagebox.showinfo(f"SSH Test ({target})", msg or "(no output)")
         return
 
     # Fallback for older ssh: plain ssh -T
-    rc2, msg2 = run_ssh(["ssh", "-T", f"git@{host}"])
+    rc2, msg2 = run_ssh(["ssh", "-T", target])
     lower = msg2.lower()
     if "continue connecting (yes/no" in lower or "authenticity of host" in lower:
         trust = messagebox.askyesno(
@@ -1246,13 +1260,13 @@ def _ssh_test_to_host(host: str):
             "Do you want to trust this host key and continue?"
         )
         if trust:
-            rc3, msg3 = run_ssh(["ssh", "-T", f"git@{host}"], feed_stdin="yes\n")
-            messagebox.showinfo(f"SSH Test ({host})", msg3 or "(no output)")
+            rc3, msg3 = run_ssh(["ssh", "-T", target], feed_stdin="yes\n")
+            messagebox.showinfo(f"SSH Test ({target})", msg3 or "(no output)")
         else:
-            messagebox.showinfo(f"SSH Test ({host})", "Aborted by user.")
+            messagebox.showinfo(f"SSH Test ({target})", "Aborted by user.")
         return
 
-    messagebox.showinfo(f"SSH Test ({host})", msg2 or "(no output)")
+    messagebox.showinfo(f"SSH Test ({target})", msg2 or "(no output)")
 
 def _default_ssh_dir() -> str:
     """Default per-user SSH directory (~/.ssh) on Windows, macOS and Linux."""
@@ -1364,35 +1378,93 @@ def _best_identity_email() -> str:
 def generate_ssh_key_help():
     """Show the ssh-keygen command (copyable) plus step-by-step instructions."""
     ssh_dir = _default_ssh_dir()
-    email = _best_identity_email()
-    command = f'ssh-keygen -t ed25519 -C "{email}"'
 
     popup = Toplevel(root)
     popup.title("Generate SSH Key")
-    popup.geometry("680x460")
-    popup.minsize(560, 400)
+    popup.geometry("680x520")
+    popup.minsize(560, 440)
     popup.transient(root)
     popup.grid_columnconfigure(0, weight=1)
-    popup.grid_rowconfigure(3, weight=1)
+    popup.grid_rowconfigure(4, weight=1)
 
     tk.Label(popup, text="Generate a new SSH key", font=("Arial", 12, "bold")).grid(
         row=0, column=0, sticky="w", padx=12, pady=(12, 2)
     )
+
+    # --- Comment (-C) field: the user's preferred label for the key ---
+    # Only letters, digits and @ . - _ are allowed. This keeps the value safe
+    # inside the -C "..." shell argument (no quotes, spaces, slashes, commas).
+    _allowed_comment_re = re.compile(r"^[A-Za-z0-9@._-]*$")
+
+    def _sanitize_comment(s: str) -> str:
+        return re.sub(r"[^A-Za-z0-9@._-]", "", s or "")
+
+    comment_var = tk.StringVar(value=_sanitize_comment(_best_identity_email()))
+    cmt_row = tk.Frame(popup)
+    cmt_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(4, 2))
+    cmt_row.grid_columnconfigure(1, weight=1)
+    tk.Label(cmt_row, text="Your preferred comment:", font=("Arial", 9)).grid(
+        row=0, column=0, sticky="w"
+    )
+
+    def _validate_comment(proposed: str) -> bool:
+        if _allowed_comment_re.match(proposed):
+            cmt_hint.configure(
+                text="This goes after -C in the command below (usually your email; "
+                     "it is just a label and can be changed later).",
+                fg="#555",
+            )
+            return True
+        cmt_hint.configure(
+            text="Only letters, digits and  @ . - _  are allowed "
+                 "(no spaces, quotes, commas or slashes).",
+            fg="#b00020",
+        )
+        cmt_row.after(1800, lambda: cmt_hint.configure(
+            text="This goes after -C in the command below (usually your email; "
+                 "it is just a label and can be changed later).",
+            fg="#555"))
+        return False
+
+    cmt_hint = tk.Label(
+        cmt_row,
+        text="This goes after -C in the command below (usually your email; "
+             "it is just a label and can be changed later).",
+        font=("Arial", 8), fg="#555", wraplength=620, justify="left",
+    )
+    cmt_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
+
+    _vcmd = (cmt_row.register(_validate_comment), "%P")
+    cmt_entry = tk.Entry(cmt_row, textvariable=comment_var, font=("Consolas", 10),
+                         validate="key", validatecommand=_vcmd)
+    cmt_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), ipady=2)
+
     tk.Label(popup, text="Run this command in your terminal:", font=("Arial", 9)).grid(
-        row=1, column=0, sticky="w", padx=12, pady=(4, 2)
+        row=2, column=0, sticky="w", padx=12, pady=(6, 2)
     )
 
     cmd_row = tk.Frame(popup)
-    cmd_row.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 6))
+    cmd_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 6))
     cmd_row.grid_columnconfigure(0, weight=1)
     cmd_entry = tk.Entry(cmd_row, font=("Consolas", 10))
-    cmd_entry.insert(0, command)
-    cmd_entry.configure(state="readonly")
     cmd_entry.grid(row=0, column=0, sticky="ew", ipady=4)
+
+    def _current_command() -> str:
+        c = _sanitize_comment(comment_var.get().strip())
+        return f'ssh-keygen -t ed25519 -C "{c}"' if c else "ssh-keygen -t ed25519"
+
+    def _refresh_cmd(*_):
+        cmd_entry.configure(state="normal")
+        cmd_entry.delete(0, tk.END)
+        cmd_entry.insert(0, _current_command())
+        cmd_entry.configure(state="readonly")
+
+    _refresh_cmd()
+    comment_var.trace_add("write", _refresh_cmd)
 
     def _copy_cmd():
         popup.clipboard_clear()
-        popup.clipboard_append(command)
+        popup.clipboard_append(_current_command())
         copy_btn.configure(text="Copied!")
         popup.after(1200, lambda: copy_btn.configure(text="Copy command"))
 
@@ -1406,20 +1478,23 @@ def generate_ssh_key_help():
         "   - On macOS / Linux, use the Terminal app.\n"
         "2. Do NOT change any directory or path - just leave the terminal\n"
         "   where it opens (your home folder).\n"
-        "3. Paste and run the command above.\n"
-        "4. Press Enter at every prompt to accept the defaults\n"
+        "3. In the \"Your preferred comment\" field above, type the label you\n"
+        "   want for this key (usually your email). It is placed after -C in\n"
+        "   the command.\n"
+        "4. Paste and run the command above.\n"
+        "5. Press Enter at every prompt to accept the defaults\n"
         "   (default file location, and an empty passphrase if you prefer).\n"
-        "5. The key pair is created in:\n   "
+        "6. The key pair is created in:\n   "
     )
     steps_after = (
         "\n   (private key: id_ed25519   |   public key: id_ed25519.pub)\n"
-        "6. Come back here and click \"Show Public Key\" - your new public\n"
+        "7. Come back here and click \"Show Public Key\" - your new public\n"
         "   key will be listed there, ready to copy into GitHub / GitLab.\n\n"
-        "Note: the -C value is just a label (usually your email). It does not\n"
-        "have to match anything and can be changed later."
+        "Note: the -C value is just a label (the comment you set above, usually\n"
+        "your email). It does not have to match anything and can be changed later."
     )
     txt = scrolledtext.ScrolledText(popup, wrap="word", font=("Arial", 9), height=12)
-    txt.grid(row=3, column=0, sticky="nsew", padx=12, pady=(4, 6))
+    txt.grid(row=4, column=0, sticky="nsew", padx=12, pady=(4, 6))
     txt.tag_configure(
         "sshpath",
         font=("Consolas", 9, "bold"),
@@ -1432,7 +1507,7 @@ def generate_ssh_key_help():
     txt.configure(state="disabled")
 
     tk.Button(popup, text="Close", command=popup.destroy).grid(
-        row=4, column=0, sticky="e", padx=12, pady=(0, 12)
+        row=5, column=0, sticky="e", padx=12, pady=(0, 12)
     )
 
 
@@ -1526,11 +1601,9 @@ def _unmanaged_host_conflict(host: str) -> bool:
 
 
 def _identity_for_host(host: str) -> str:
-    """IdentityFile mapped to `host` in the managed fence, or ''."""
-    for h in _managed_hosts():
-        if h["host"] == host:
-            return h.get("identityfile", "")
-    return ""
+    """IdentityFile of the canonical managed profile for `host`, or ''."""
+    ps = _profiles_for_host(host)
+    return ps[0].get("identityfile", "") if ps else ""
 
 
 def _render_host_block(h: dict) -> str:
@@ -1603,25 +1676,115 @@ def _write_managed_hosts(hosts: list[dict]) -> str | None:
     return backup
 
 
-def _set_host_identity(host: str, identity_path: str) -> str | None:
-    """Add/update one managed Host block; returns backup path."""
+def _profile_server(h: dict) -> str:
+    """The real GitLab hostname a managed block points at (HostName, else alias)."""
+    return h.get("hostname") or h.get("host", "")
+
+
+def _profiles_for_host(host: str) -> list[dict]:
+    """Every managed profile whose server (or alias) is `host`, canonical first.
+
+    Multiple profiles per server are allowed; the one whose alias equals the
+    hostname (the plain-'git@host' default) is returned first.
+    """
+    if not host:
+        return []
+    out = [h for h in _managed_hosts()
+           if h.get("host") == host or _profile_server(h) == host]
+    out.sort(key=lambda h: 0 if h.get("host") == _profile_server(h) else 1)
+    return out
+
+
+def _profile_alias(hostname: str, user: str, taken) -> str:
+    """A unique managed 'Host' alias for one (hostname, login) profile."""
+    user = user or "git"
+    base = hostname if user == "git" else f"{hostname}-{user}"
+    if base not in taken:
+        return base
+    n = 2
+    while f"{base}-{n}" in taken:
+        n += 1
+    return f"{base}-{n}"
+
+
+def _upsert_profile(hostname: str, identity_path: str, user: str,
+                    alias: str | None = None) -> str | None:
+    """Add a managed SSH profile, or update the one named `alias`. Returns backup.
+
+    Servers may have several profiles (different logins / keys). When editing
+    (`alias` given) that profile is updated. When adding, an identical profile
+    (same server + login + key) is left as-is; anything else becomes a new entry
+    with its own alias — an existing profile is never silently overwritten.
+    """
+    user = user or "git"
     hosts = _managed_hosts()
-    for h in hosts:
-        if h["host"] == host:
-            h["identityfile"] = identity_path
-            h["hostname"] = h.get("hostname") or host
-            h["user"] = h.get("user") or "git"
-            break
+    taken = {h["host"] for h in hosts}
+
+    target = None
+    if alias:
+        target = next((h for h in hosts if h["host"] == alias), None)
+    if target is None:
+        target = next((h for h in hosts
+                       if _profile_server(h) == hostname
+                       and (h.get("user") or "git") == user
+                       and h.get("identityfile") == identity_path), None)
+
+    if target is not None:
+        target["hostname"] = hostname
+        target["user"] = user
+        target["identityfile"] = identity_path
     else:
-        hosts.append({"host": host, "hostname": host, "user": "git",
+        hosts.append({"host": _profile_alias(hostname, user, taken),
+                      "hostname": hostname, "user": user,
                       "identityfile": identity_path, "identitiesonly": "yes"})
     return _write_managed_hosts(hosts)
 
 
-def _remove_host_identity(host: str) -> str | None:
-    """Drop one managed Host block; returns backup path."""
-    hosts = [h for h in _managed_hosts() if h["host"] != host]
+def _remove_host_identity(alias: str) -> str | None:
+    """Drop the managed profile named `alias`; returns backup path."""
+    hosts = [h for h in _managed_hosts() if h["host"] != alias]
     return _write_managed_hosts(hosts)
+
+
+def _repair_managed_ssh_config() -> bool:
+    """Fix malformed managed Host blocks written by older versions.
+
+    Those glued the login onto the alias ('Host ccl@git.example.com') instead of
+    'Host git.example.com' + 'User ccl'. Rewrite each such block into a proper
+    profile (bare hostname as HostName, 'user@' moved to the User line, a unique
+    alias), keeping it as its own entry so nothing is silently merged away.
+    Returns True if anything changed.
+    """
+    hosts = _managed_hosts()
+    if not any("@" in h.get("host", "") or "@" in h.get("hostname", "") for h in hosts):
+        return False
+
+    fixed: list[dict] = []
+    taken: set = set()
+    for h in hosts:
+        alias = h.get("host", "")
+        user = h.get("user") or ""
+        hn = h.get("hostname") or alias
+        if "@" in alias:
+            u, _, bare = alias.partition("@")
+            if u and (not user or user == "git"):
+                user = u
+            alias = bare or alias
+        if "@" in hn:
+            hn = hn.split("@", 1)[1]
+        hn = hn or alias
+        user = user or "git"
+        # drop an exact duplicate of one we already kept
+        if any(f.get("hostname") == hn and (f.get("user") or "git") == user
+               and f.get("identityfile") == h.get("identityfile") for f in fixed):
+            continue
+        new_alias = alias if alias and alias not in taken else \
+            _profile_alias(hn, user, taken)
+        taken.add(new_alias)
+        fixed.append({**h, "host": new_alias, "hostname": hn, "user": user})
+
+    _write_managed_hosts(fixed)
+    return True
 
 
 def _list_private_keys() -> list[str]:
@@ -1701,6 +1864,10 @@ def _origin_host_or_blank() -> str:
 
 def manage_server_keys():
     """View / edit the per-GitLab-server SSH identity mappings in ~/.ssh/config."""
+    try:
+        _repair_managed_ssh_config()
+    except Exception:
+        pass
     popup = Toplevel(root)
     popup.title("Manage Server Keys")
     popup.geometry("820x460")
@@ -1720,10 +1887,11 @@ def manage_server_keys():
     table_wrap.grid_rowconfigure(0, weight=1)
     table_wrap.grid_columnconfigure(0, weight=1)
 
-    cols = ("host", "key", "pub", "status")
+    cols = ("host", "login", "key", "pub", "status")
     tree = ttk.Treeview(table_wrap, columns=cols, show="headings", selectmode="browse")
-    for c, t, w in (("host", "GitLab server", 220), ("key", "Key file", 240),
-                    ("pub", ".pub?", 70), ("status", "Status", 180)):
+    for c, t, w in (("host", "GitLab server", 210), ("login", "SSH login", 90),
+                    ("key", "Key file", 220),
+                    ("pub", ".pub?", 60), ("status", "Status", 170)):
         tree.heading(c, text=t)
         tree.column(c, width=w, anchor="w", stretch=(c == "status"))
     vbar = ttk.Scrollbar(table_wrap, orient="vertical", command=tree.yview)
@@ -1750,20 +1918,24 @@ def manage_server_keys():
             else:
                 status = "OK"
             tree.insert("", "end", iid=h["host"],
-                        values=(h["host"], os.path.basename(ident) or "(none)",
+                        values=(_profile_server(h), h.get("user") or "git",
+                                os.path.basename(ident) or "(none)",
                                 "yes" if has_pub else "no", status))
         oh = _origin_host_or_blank()
         if oh:
-            ident = _identity_for_host(oh)
-            if ident:
+            profs = _profiles_for_host(oh)
+            if profs:
+                names = ", ".join(f"{p.get('user') or 'git'} ({os.path.basename(p.get('identityfile',''))})"
+                                  for p in profs)
                 active_lbl.config(
-                    text=f"Loaded repo host: {oh}\nActive key: {ident}", fg="#0a0")
+                    text=f"Loaded repo host: {oh}\nProfile(s): {names}", fg="#0a0")
+                first_alias = profs[0]["host"]
+                if first_alias in tree.get_children():
+                    tree.selection_set(first_alias)
             else:
                 active_lbl.config(
                     text=f"Loaded repo host: {oh}\nNo key mapped for this server yet "
-                         f"— select it below (or Add mapping) to set one.", fg="#a60")
-            if oh in tree.get_children():
-                tree.selection_set(oh)
+                         f"— use Add mapping to set one.", fg="#a60")
         else:
             active_lbl.config(text="No repo loaded (or remote is not recognised).", fg="#666")
 
@@ -1771,46 +1943,65 @@ def manage_server_keys():
         sel = tree.selection()
         return sel[0] if sel else ""
 
-    def _open_editor(host_prefill=""):
-        _key_mapping_editor(popup, host_prefill, _refresh)
+    def _selected_profile():
+        a = _selected_host()
+        return next((h for h in _managed_hosts() if h["host"] == a), None)
+
+    def _open_editor(host_prefill="", edit_alias=None):
+        if edit_alias:
+            prof = next((h for h in _managed_hosts() if h["host"] == edit_alias), None)
+            if not prof:
+                return
+            hn = _profile_server(prof)
+            u = prof.get("user") or "git"
+            host_prefill = f"{u}@{hn}" if u != "git" else hn
+        _key_mapping_editor(popup, host_prefill, _refresh, edit_alias)
+
+    def _edit_selected():
+        a = _selected_host()
+        if a:
+            _open_editor(edit_alias=a)
 
     def _remove():
-        host = _selected_host()
-        if not host:
+        prof = _selected_profile()
+        if not prof:
             return
+        label = f"{prof.get('user') or 'git'}@{_profile_server(prof)}"
         if not messagebox.askyesno(
             "Remove mapping",
-            f"Remove the managed SSH config block for:\n\n{host}\n\n"
+            f"Remove this managed SSH profile?\n\n{label}\n"
+            f"key: {os.path.basename(prof.get('identityfile',''))}\n\n"
             "The key files on disk are NOT deleted.", parent=popup):
             return
         try:
-            bak = _remove_host_identity(host)
+            bak = _remove_host_identity(prof["host"])
             _refresh()
-            messagebox.showinfo("Removed", f"Removed {host}."
+            messagebox.showinfo("Removed", f"Removed {label}."
                                 + (f"\nBackup: {bak}" if bak else ""), parent=popup)
         except Exception as e:
             messagebox.showerror("Error", str(e), parent=popup)
 
     def _test():
-        host = _selected_host()
-        if host:
-            _ssh_test_to_host(host)
+        a = _selected_host()
+        if a:
+            _ssh_test_to_host(a)
 
     def _show_pub():
-        host = _selected_host()
-        if not host:
+        prof = _selected_profile()
+        if not prof:
             return
-        ident = _identity_for_host(host)
+        server = _profile_server(prof)
+        ident = prof.get("identityfile", "")
         pub = _read_pub_for_identity(ident)
         if not pub:
             messagebox.showinfo("Public key", f"No .pub found for:\n{ident}", parent=popup)
             return
         w = Toplevel(popup)
-        w.title(f"{host} — public key")
+        w.title(f"{server} — public key")
         w.geometry("760x200")
         w.transient(popup)
         tk.Label(w, text=f"{os.path.basename(ident)}.pub  —  paste into "
-                 f"https://{host}/-/user_settings/ssh_keys", font=("Arial", 9)).pack(
+                 f"https://{server}/-/user_settings/ssh_keys", font=("Arial", 9)).pack(
             anchor="w", padx=10, pady=(10, 4))
         t = scrolledtext.ScrolledText(w, wrap="word", height=5, font=("Consolas", 9))
         t.pack(fill="both", expand=True, padx=10, pady=4)
@@ -1824,7 +2015,7 @@ def manage_server_keys():
     btn_row = tk.Frame(popup)
     btn_row.grid(row=4, column=0, sticky="w", padx=12, pady=10)
     tk.Button(btn_row, text="Add mapping", command=lambda: _open_editor(_origin_host_or_blank())).pack(side="left", padx=4)
-    tk.Button(btn_row, text="Edit selected", command=lambda: _open_editor(_selected_host())).pack(side="left", padx=4)
+    tk.Button(btn_row, text="Edit selected", command=_edit_selected).pack(side="left", padx=4)
     tk.Button(btn_row, text="Remove", command=_remove).pack(side="left", padx=4)
     tk.Button(btn_row, text="Test selected", command=_test).pack(side="left", padx=4)
     tk.Button(btn_row, text="Show .pub", command=_show_pub).pack(side="left", padx=4)
@@ -1833,33 +2024,46 @@ def manage_server_keys():
     _refresh()
 
 
-def _key_mapping_editor(parent, host_prefill, on_done):
-    """Sub-dialog: choose (or generate) the key for one GitLab server."""
+def _key_mapping_editor(parent, host_prefill, on_done, edit_alias=None):
+    """Sub-dialog: choose (or generate) the key for one GitLab-server SSH profile.
+
+    `edit_alias` is the managed Host alias being edited; None means add a new
+    profile (a server may have several, one per login / key).
+    """
     win = Toplevel(parent)
-    win.title("Add / edit mapping")
+    win.title("Edit SSH profile" if edit_alias else "Add SSH profile")
     win.geometry("560x360")
     win.transient(parent)
     win.grab_set()
     win.grid_columnconfigure(0, weight=1)
 
-    tk.Label(win, text="GitLab server — hostname or any URL from it:", font=("Arial", 9)).grid(
-        row=0, column=0, sticky="w", padx=12, pady=(14, 2))
-    host_var = tk.StringVar(value=host_prefill or "")
+    tk.Label(win, text="GitLab server — hostname or any URL from it.\n"
+             "Prefix with 'user@' only if the server needs a non-'git' login "
+             "(e.g. ccl@git.linglit.tu-darmstadt.de).\n"
+             "You can add more than one profile per server.", font=("Arial", 9),
+             justify="left").grid(row=0, column=0, sticky="w", padx=12, pady=(14, 2))
+    _pf_user, _pf_host = _split_user_host(host_prefill or "")
+    host_var = tk.StringVar(value=f"{_pf_user}@{_pf_host}" if _pf_user else (_pf_host or ""))
     host_entry = tk.Entry(win, textvariable=host_var, font=("Consolas", 10))
     host_entry.grid(row=1, column=0, sticky="ew", padx=12)
 
     def _normalize_host(*_):
         raw = host_var.get()
-        h = _host_from_any(raw)
-        if h and h != raw:
-            host_var.set(h)
+        user, h = _split_user_host(raw)
+        norm = f"{user}@{h}" if user else h
+        if h and norm != raw:
+            host_var.set(norm)
     host_entry.bind("<FocusOut>", _normalize_host)
 
     tk.Label(win, text="Key to use for this server:", font=("Arial", 9)).grid(
         row=2, column=0, sticky="w", padx=12, pady=(14, 2))
 
     keys = _list_private_keys()
-    existing = _identity_for_host(host_prefill) if host_prefill else ""
+    if edit_alias:
+        _ep = next((h for h in _managed_hosts() if h["host"] == edit_alias), None)
+        existing = _ep.get("identityfile", "") if _ep else ""
+    else:
+        existing = ""
     existing_base = os.path.basename(existing) if existing else ""
     key_var = tk.StringVar(value=existing_base if existing_base in keys
                            else (keys[0] if keys else "__new__"))
@@ -1882,7 +2086,7 @@ def _key_mapping_editor(parent, host_prefill, on_done):
     newname_frame.grid(row=4, column=0, sticky="ew", padx=12, pady=(6, 0))
     newname_lbl = tk.Label(newname_frame, text="New key file name:", font=("Arial", 9))
     newname_lbl.pack(side="left")
-    newname_var = tk.StringVar(value=_suggest_key_name(host_prefill) if host_prefill else "id_ed25519_key")
+    newname_var = tk.StringVar(value=_suggest_key_name(_pf_host) if _pf_host else "id_ed25519_key")
     newname_entry = tk.Entry(newname_frame, textvariable=newname_var, font=("Consolas", 10), width=28)
     newname_entry.pack(side="left", padx=6)
 
@@ -1903,10 +2107,11 @@ def _key_mapping_editor(parent, host_prefill, on_done):
     status.grid(row=5, column=0, sticky="w", padx=12, pady=(10, 0))
 
     def _save():
-        host = _host_from_any(host_var.get())
-        host_var.set(host)
+        user, host = _split_user_host(host_var.get())
+        host_var.set(f"{user}@{host}" if user else host)
         if not host or " " in host or "/" in host or "." not in host:
-            status.config(text="Enter a hostname or a URL, e.g. gitlab.dlr.de")
+            status.config(text="Enter a hostname or a URL, e.g. gitlab.dlr.de "
+                               "(optionally 'user@host').")
             return
         if _unmanaged_host_conflict(host):
             status.config(text=f"'{host}' is already configured manually in ~/.ssh/config "
@@ -1935,15 +2140,18 @@ def _key_mapping_editor(parent, host_prefill, on_done):
             identity = _tilde_path(key_path)
 
         try:
-            bak = _set_host_identity(host, identity)
+            # The editor always shows the current login as a 'user@' prefix, so
+            # an empty prefix here is an explicit choice of the default 'git'.
+            bak = _upsert_profile(host, identity, user or "git", alias=edit_alias)
         except Exception as e:
             messagebox.showerror("Error", f"Could not write ~/.ssh/config:\n{e}", parent=win)
             return
 
         pub = _read_pub_for_identity(identity)
+        login = user or "git"
         win.destroy()
         on_done()
-        info = (f"Mapped {host}  →  {identity}\n"
+        info = (f"Mapped {login}@{host}  →  {identity}\n"
                 + (f"Backup: {bak}\n" if bak else "")
                 + ("\nAdd this public key to the server "
                    f"(https://{host}/-/user_settings/ssh_keys):\n\n{pub}" if pub else ""))
@@ -1971,7 +2179,95 @@ def _host_from_any(text: str) -> str:
     m = re.match(r'^(?:[^@/\s]+@)?(?P<host>[^:/\s]+)[:/]', t)
     if m:
         return m.group("host")
-    return t.split("/")[0].split(":")[0]
+    return t.split("/")[0].split(":")[0].split("@")[-1]
+
+
+def _split_user_host(text: str):
+    """Split an optional explicit 'user@' prefix from a host string / URL.
+
+    Returns (user, host). `user` is '' when the text carries no explicit user,
+    so callers fall back to the 'git' default. Something like
+    'ccl@git.linglit.tu-darmstadt.de' -> ('ccl', 'git.linglit.tu-darmstadt.de');
+    a plain 'gitlab.dlr.de' -> ('', 'gitlab.dlr.de').
+    """
+    t = (text or "").strip()
+    if not t:
+        return "", ""
+    # scheme URL: ssh://user@host/..., https://host/...
+    if re.match(r'^[a-zA-Z][a-zA-Z0-9+.\-]*://', t):
+        try:
+            p = urlparse(t)
+            return (p.username or ""), (p.hostname or "")
+        except ValueError:
+            return "", ""
+    user = ""
+    m = re.match(r'^(?P<user>[^@/\s:]+)@(?P<rest>\S+)$', t)
+    if m:
+        user, t = m.group("user"), m.group("rest")
+    return user, _host_from_any(t)
+
+
+def _login_for_host(host: str) -> str:
+    """SSH login mapped to `host` in the managed ~/.ssh/config fence.
+
+    Defaults to 'git'; some GitLab installs (e.g. git.linglit.tu-darmstadt.de)
+    require a different account name. When a server has several profiles this
+    returns the canonical one's login.
+    """
+    ps = _profiles_for_host(host)
+    return (ps[0].get("user") or "git") if ps else "git"
+
+
+def _is_ssh_url(url: str) -> bool:
+    """True for ssh:// URLs and scp-like 'user@host:path' remotes (any user)."""
+    u = (url or "").strip()
+    return bool(u) and (u.startswith("ssh://")
+                        or re.match(r'^[^@/\s]+@[^/\s:]+:', u) is not None)
+
+
+def _repo_dirname_from_url(url: str) -> str:
+    """Local folder name git would use for `url`: the last path component, minus
+    a trailing '.git'. Unlike os.path.basename this understands scp-like SSH URLs
+    ('user@host:group/repo.git') and never returns something with ':' or '@' in
+    it, which Windows can't use as a directory name.
+    """
+    u = (url or "").strip().rstrip("/")
+    if not u:
+        return "repo"
+    if "://" in u:
+        path = urlparse(u).path
+    elif _is_ssh_url(u):                       # scp-like: user@host:path
+        path = u.split(":", 1)[1]
+    else:
+        path = u.replace("\\", "/")
+    name = path.rstrip("/").split("/")[-1]
+    if name.endswith(".git"):
+        name = name[:-4]
+    name = re.sub(r'[<>:"/\\|?*@]+', "", name).strip()
+    return name or "repo"
+
+
+def _rewrite_url_user(url: str, login: str) -> str:
+    """Return `url` with its SSH login set to `login` (ssh:// or scp-like form)."""
+    if not login or not url:
+        return url
+    if url.startswith("ssh://"):
+        rest = url[len("ssh://"):].split("@", 1)[-1]
+        return f"ssh://{login}@{rest}"
+    if "://" in url:                                   # http(s)/git/etc. — leave alone
+        return url
+    m = re.match(r'^[^@/\s]+@(?P<rest>.+)$', url)      # already has 'user@'
+    if m:
+        return f"{login}@{m.group('rest')}"
+    if re.match(r'^[^/\s:]+:', url):                   # 'host:path', no user
+        return f"{login}@{url}"
+    return url
+
+
+def _ssh_cmd_for_key(key_path: str) -> str:
+    """A `core.sshCommand` / GIT_SSH_COMMAND value that forces exactly one key."""
+    p = os.path.abspath(os.path.expanduser(key_path)).replace("\\", "/")
+    return f'ssh -i "{p}" -o IdentitiesOnly=yes'
 
 
 def _known_hosts_path() -> str:
@@ -2073,11 +2369,16 @@ def _ensure_host_key_trusted(host: str, parent=None) -> bool:
 # =============== Repository SSH connection strip (one action per button) ===============
 
 def _ssh_auth_probe(host: str):
-    """Non-interactive `ssh -T git@host`. Returns (authenticated, message)."""
+    """Non-interactive `ssh -T <login>@host`. Returns (authenticated, message).
+
+    `login` is the account mapped for the host in ~/.ssh/config (default 'git').
+    """
+    user, host = _split_user_host(host)
+    login = user or _login_for_host(host)
     try:
         res = subprocess.run(
             ["ssh", "-T", "-o", "StrictHostKeyChecking=accept-new",
-             "-o", "BatchMode=yes", f"git@{host}"],
+             "-o", "BatchMode=yes", f"{login}@{host}"],
             text=True, capture_output=True, startupinfo=_win_startupinfo(),
         )
         msg = ((res.stdout or "") + (res.stderr or "")).strip()
@@ -2108,7 +2409,7 @@ def show_remote_urls():
         return
     r = _get_primary_remote()
     url = r.url if r else ""
-    if url.startswith("git@") or url.startswith("ssh://"):
+    if _is_ssh_url(url):
         verdict = 'origin is already SSH.\nNext: click "Trust Server Host Key".'
     elif url.startswith("http://") or url.startswith("https://"):
         verdict = 'origin is HTTPS.\nNext: click "Convert Origin to SSH".'
@@ -2125,7 +2426,7 @@ def convert_origin_to_ssh():
                              "No remote found. Load a repository with a remote first.")
         return
     url = r.url
-    if url.startswith("git@") or url.startswith("ssh://"):
+    if _is_ssh_url(url):
         messagebox.showinfo("Convert Origin to SSH",
                             f"'{r.name}' is already SSH:\n{url}\n\n"
                             'Nothing to do.\nNext: click "Trust Server Host Key".')
@@ -2134,7 +2435,7 @@ def convert_origin_to_ssh():
     if not host or not path:
         messagebox.showerror("Convert Origin to SSH", f"Cannot parse the URL:\n{url}")
         return
-    ssh_url = f"git@{host}:{path}.git"
+    ssh_url = f"{_login_for_host(host)}@{host}:{path}.git"
     if not messagebox.askyesno(
         "Convert Origin to SSH",
         f"Change the '{r.name}' remote URL\n\nfrom:  {url}\nto:    {ssh_url}\n\nProceed?"):
@@ -2398,6 +2699,115 @@ def browse_folder():
         clone_dir_entry.delete(0, tk.END)
         clone_dir_entry.insert(0, folder)
 
+def _pick_clone_ssh_identity(repo_url: str):
+    """Before an SSH clone, make sure a key profile exists and let the user pick one.
+
+    A managed Server Key profile mapped to the clone host is REQUIRED and the user
+    must pick one explicitly — there is no "let SSH decide" / auto fallback and no
+    borrowing another server's profile.
+
+    Returns (proceed, ssh_command, effective_url):
+      proceed        False  -> abort the clone (no profile for this host, or cancelled)
+      ssh_command    'ssh…' -> force this key for the clone AND persist it as the
+                               cloned repo's core.sshCommand
+      effective_url         -> repo_url, with its SSH login rewritten to match the
+                               chosen profile when they differ
+    """
+    try:
+        _repair_managed_ssh_config()
+    except Exception:
+        pass
+    user_in, host = _split_user_host(repo_url)
+    mappings = _managed_hosts()
+    match_aliases = {m["host"] for m in _profiles_for_host(host)}
+    host_matches = [m for m in mappings if m["host"] in match_aliases]
+
+    if not host_matches:
+        messagebox.showwarning(
+            "Server Key profile required",
+            f"No Server Key profile is mapped to “{host or repo_url}”.\n\n"
+            "An SSH clone requires a key set up for this server. Opening "
+            "“Manage Server Keys” — add a profile for this server (set the SSH "
+            "login it expects — e.g. git or ccl — and pick or generate a key), "
+            "then start the clone again.")
+        manage_server_keys()
+        return False, "", repo_url
+
+    win = Toplevel(root)
+    win.title("Choose Server Key profile for clone")
+    win.transient(root)
+    win.grab_set()
+    win.grid_columnconfigure(0, weight=1)
+
+    tk.Label(win, text=f"Cloning:  {repo_url}", font=("Arial", 9),
+             wraplength=540, justify="left").grid(row=0, column=0, sticky="w",
+                                                  padx=14, pady=(14, 2))
+    tk.Label(win, text=f"Select the Server Key profile to use for {host}. "
+             "A mapped profile is required — there is no automatic fallback.",
+             font=("Arial", 8), fg="#0a0", wraplength=540,
+             justify="left").grid(row=1, column=0, sticky="w", padx=14, pady=(0, 8))
+
+    choice = tk.StringVar()
+    box = tk.Frame(win)
+    box.grid(row=2, column=0, sticky="w", padx=14)
+
+    for m in host_matches:
+        login = m.get("user") or "git"
+        ident = m.get("identityfile", "")
+        key_ok = bool(ident) and os.path.isfile(_expand_key_path(ident))
+        kb = os.path.basename(_expand_key_path(ident)) if ident else "(no key)"
+        tk.Radiobutton(
+            box, variable=choice, value=m["host"], anchor="w",
+            text=f"{login}@{_profile_server(m)}   ·   {kb}"
+                 + ("" if key_ok else "   — key file missing"),
+        ).pack(anchor="w")
+
+    # preselect: a host profile whose login matches the URL's 'user@', else the
+    # first (canonical) host profile
+    default_val = next(
+        (m["host"] for m in host_matches
+         if user_in and (m.get("user") or "git") == user_in),
+        host_matches[0]["host"])
+    choice.set(default_val)
+
+    out = {"proceed": False, "cmd": "", "url": repo_url}
+
+    def _do():
+        v = choice.get()
+        m = next((x for x in host_matches if x["host"] == v), None)
+        if not m:
+            messagebox.showerror(
+                "Server Key profile",
+                "Select a Server Key profile mapped to this server to continue.",
+                parent=win)
+            return
+        ident = m.get("identityfile", "")
+        if not ident or not os.path.isfile(_expand_key_path(ident)):
+            messagebox.showerror(
+                "SSH profile",
+                "That profile has no usable private key.\nFix it in "
+                "“Manage Server Keys” first.", parent=win)
+            return
+        login = m.get("user") or "git"
+        out.update(proceed=True,
+                   cmd=_ssh_cmd_for_key(_expand_key_path(ident)),
+                   url=_rewrite_url_user(repo_url, login))
+        win.destroy()
+
+    def _manage():
+        win.destroy()
+        manage_server_keys()
+
+    btns = tk.Frame(win)
+    btns.grid(row=3, column=0, sticky="e", padx=14, pady=14)
+    tk.Button(btns, text="Manage profiles…", command=_manage).pack(side="left", padx=4)
+    tk.Button(btns, text="Cancel", command=win.destroy).pack(side="left", padx=4)
+    tk.Button(btns, text="Clone", command=_do).pack(side="left", padx=4)
+
+    win.wait_window()
+    return out["proceed"], out["cmd"], out["url"]
+
+
 def clone_repo():
     """Clone or load an existing repo based on inputs, with thread-safe UI updates."""
     repo_url = repo_entry.get().strip()
@@ -2430,10 +2840,7 @@ def clone_repo():
                 if not os.path.exists(base_dir):
                     os.makedirs(base_dir, exist_ok=True)
 
-                base_name = os.path.basename(repo_url.replace("\\", "/"))
-                if base_name.endswith(".git"):
-                    base_name = base_name[:-4]
-                repo_name = base_name or "repo"
+                repo_name = _repo_dirname_from_url(repo_url)
                 full_clone_path = os.path.join(base_dir, repo_name)
 
                 # Case 2: Repo already cloned at full_clone_path
@@ -2445,10 +2852,26 @@ def clone_repo():
                     result["path"] = full_clone_path
                 else:
                     # Case 3: Fresh clone
-                    if repo_url.startswith("git@") or repo_url.startswith("ssh://"):
+                    clone_url = repo_url
+                    ssh_cmd = ""
+                    if _is_ssh_url(repo_url):
                         if not _ensure_ssh_host_trusted(repo_url):
                             raise Exception("SSH host key not trusted; clone canceled.")
-                    repo = Repo.clone_from(repo_url, full_clone_path)
+                        proceed, ssh_cmd, clone_url = _pick_clone_ssh_identity(repo_url)
+                        if not proceed:
+                            raise Exception(
+                                "Clone canceled — set up or choose an SSH profile in "
+                                "“Manage Server Keys”, then clone again.")
+                    # Force the chosen key via GIT_SSH_COMMAND for the clone, then
+                    # persist it as the repo's core.sshCommand so later fetch/push
+                    # reuse it. (GitPython refuses `--config` in multi_options.)
+                    clone_env = {"GIT_SSH_COMMAND": ssh_cmd} if ssh_cmd else None
+                    repo = Repo.clone_from(clone_url, full_clone_path, env=clone_env)
+                    if ssh_cmd:
+                        try:
+                            repo.git.config("core.sshCommand", ssh_cmd)
+                        except Exception:
+                            pass
                     _ensure_gitignore(repo.working_dir)
                     result["ok"] = True
                     result["kind"] = "cloned"
@@ -2472,6 +2895,17 @@ def clone_repo():
                     hint = ("\n\nThis looks like an HTTPS authentication failure. Open the "
                             "'Git AuthN' tab -> HTTPS Access Token, save a Personal Access "
                             "Token for this host, then clone again.")
+                elif _is_ssh_url(repo_url) and any(
+                    s in low for s in ("permission denied", "publickey",
+                                       "could not read from remote repository",
+                                       "authentication failed", "access denied")):
+                    _h, _ = _split_user_host(repo_url)
+                    hint = ("\n\nThis looks like an SSH key problem for "
+                            f"“{_h or 'this server'}”. Open 'Git AuthN' -> SSH -> "
+                            "'Manage Server Keys' and set up a profile for this "
+                            "server (the SSH login it expects — e.g. git or ccl — "
+                            "and a key whose .pub is added on the server), then "
+                            "clone again.")
                 messagebox.showerror("Error", f"Failed to clone/load repo:\n{err_text}{hint}")
                 return
 
@@ -2627,10 +3061,142 @@ def git_fetch_status():
         r = _get_primary_remote()
         if r:
             r.fetch()
-        status = repo.git.status()
-        messagebox.showinfo("Git Status", status)
+        raw = repo.git.status()
+        try:
+            porc = repo.git.status("--porcelain=v2", "--branch")
+        except Exception:
+            porc = ""
     except Exception as e:
         messagebox.showerror("Error", f"Git fetch/status failed:\n{e}")
+        return
+    _show_git_status(raw, porc)
+
+
+_GIT_XY_DESC = {
+    "M": "modified", "T": "type changed", "A": "added", "D": "deleted",
+    "R": "renamed", "C": "copied", "U": "unmerged",
+}
+
+
+def _describe_xy(xy):
+    """Turn a porcelain-v2 <XY> code into a human phrase + staged/unstaged hint."""
+    staged = xy[0] if xy and xy[0] != "." else ""
+    work = xy[1] if len(xy) > 1 and xy[1] != "." else ""
+    parts = []
+    if staged:
+        parts.append(f"staged: {_GIT_XY_DESC.get(staged, staged)}")
+    if work:
+        parts.append(f"unstaged: {_GIT_XY_DESC.get(work, work)}")
+    return ", ".join(parts) or "changed"
+
+
+def _show_git_status(raw, porc):
+    branch = upstream = None
+    ahead = behind = 0
+    files = []  # (state, path)
+    for line in (porc or "").splitlines():
+        if line.startswith("# branch.head"):
+            branch = line.split(" ", 2)[2].strip()
+        elif line.startswith("# branch.upstream"):
+            upstream = line.split(" ", 2)[2].strip()
+        elif line.startswith("# branch.ab"):
+            try:
+                a, b = line.split(" ")[2:4]
+                ahead, behind = int(a.lstrip("+")), int(b.lstrip("-"))
+            except Exception:
+                pass
+        elif line[:2] in ("1 ", "2 "):
+            fields = line.split(" ", 8)
+            xy = fields[1]
+            rest = fields[8] if len(fields) > 8 else ""
+            if line.startswith("2 "):
+                # "<rename-score> <newpath>\t<oldpath>"
+                rest = rest.split(" ", 1)[1] if " " in rest else rest
+                if "\t" in rest:
+                    new_p, old_p = rest.split("\t", 1)
+                    rest = f"{old_p}  →  {new_p}"
+            files.append((_describe_xy(xy), rest))
+        elif line.startswith("? "):
+            files.append(("untracked", line[2:]))
+        elif line.startswith("! "):
+            files.append(("ignored", line[2:]))
+
+    popup = Toplevel(root)
+    popup.title("Git Status")
+    popup.geometry("640x460")
+    popup.minsize(460, 300)
+    popup.transient(root)
+    popup.grid_rowconfigure(2, weight=1)
+    popup.grid_columnconfigure(0, weight=1)
+
+    tk.Label(popup, text="Git Status", font=("Segoe UI", 14, "bold")).grid(
+        row=0, column=0, sticky="w", padx=14, pady=(12, 4))
+
+    if upstream:
+        if ahead == 0 and behind == 0:
+            sync = f"up to date with '{upstream}'"
+        else:
+            bits = []
+            if ahead:
+                bits.append(f"{ahead} ahead")
+            if behind:
+                bits.append(f"{behind} behind")
+            sync = f"{', '.join(bits)} vs '{upstream}'"
+    else:
+        sync = "no upstream tracking branch"
+    clean = " — working tree clean" if not files else f" — {len(files)} changed path(s)"
+    tk.Label(popup, text=f"On branch {branch or '?'}   ·   {sync}{clean}",
+             font=("Segoe UI", 10)).grid(row=1, column=0, sticky="w", padx=14, pady=(0, 8))
+
+    wrap = tk.Frame(popup)
+    wrap.grid(row=2, column=0, sticky="nsew", padx=14)
+    wrap.grid_rowconfigure(0, weight=1)
+    wrap.grid_columnconfigure(0, weight=1)
+
+    tree = ttk.Treeview(wrap, columns=("state", "path"), show="headings", selectmode="extended")
+    tree.heading("state", text="State")
+    tree.heading("path", text="File")
+    tree.column("state", width=180, minwidth=100, stretch=False, anchor="w")
+    tree.column("path", width=400, minwidth=200, stretch=True, anchor="w")
+    vbar = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
+    hbar = ttk.Scrollbar(wrap, orient="horizontal", command=tree.xview)
+    tree.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    vbar.grid(row=0, column=1, sticky="ns")
+    hbar.grid(row=1, column=0, sticky="ew")
+
+    if files:
+        for state, path in files:
+            tree.insert("", "end", values=(state, path))
+    else:
+        tree.insert("", "end", values=("clean", "nothing to commit"))
+
+    def _copy_list():
+        popup.clipboard_clear()
+        popup.clipboard_append("\n".join(
+            "\t".join(tree.item(i, "values")) for i in tree.get_children()))
+
+    def _copy_raw():
+        popup.clipboard_clear()
+        popup.clipboard_append(raw or "")
+
+    def _show_raw():
+        w = Toplevel(popup)
+        w.title("git status (raw)")
+        w.geometry("620x420")
+        w.transient(popup)
+        t = scrolledtext.ScrolledText(w, wrap="none", font=("Consolas", 9))
+        t.pack(fill="both", expand=True)
+        t.insert("1.0", raw or "(no output)")
+        t.configure(state="disabled")
+
+    btn_row = tk.Frame(popup)
+    btn_row.grid(row=3, column=0, sticky="e", padx=14, pady=10)
+    tk.Button(btn_row, text="Copy list", command=_copy_list).pack(side="left", padx=4)
+    tk.Button(btn_row, text="Copy raw", command=_copy_raw).pack(side="left", padx=4)
+    tk.Button(btn_row, text="Raw output", command=_show_raw).pack(side="left", padx=4)
+    tk.Button(btn_row, text="Close", command=popup.destroy).pack(side="left", padx=4)
+    popup.bind("<Escape>", lambda _e: popup.destroy())
 
 def git_log_branch():
     global repo
@@ -2638,16 +3204,126 @@ def git_log_branch():
         messagebox.showwarning("Error", "No repository loaded.")
         return
     branch_name = branch_var.get()
+    fmt = "%h\x1f%an\x1f%ad\x1f%s"
     try:
         try:
-            log = repo.git.log(branch_name, '--oneline')
+            log = repo.git.log(branch_name, f"--pretty=format:{fmt}", "--date=short")
         except Exception:
             r = _get_primary_remote()
             rb = f"{r.name}/{branch_name}" if r else branch_name
-            log = repo.git.log(rb, '--oneline')
-        messagebox.showinfo(f"Git Log - {branch_name}", log or "No commits found.")
+            log = repo.git.log(rb, f"--pretty=format:{fmt}", "--date=short")
     except Exception as e:
         messagebox.showerror("Error", f"Git log failed:\n{e}")
+        return
+
+    rows = []
+    for line in (log or "").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\x1f")
+        while len(parts) < 4:
+            parts.append("")
+        rows.append(tuple(parts[:4]))
+
+    if not rows:
+        messagebox.showinfo(f"Git Log - {branch_name}", "No commits found.")
+        return
+
+    _show_git_log_table(branch_name, rows)
+
+
+def _show_git_log_table(branch_name, rows):
+    """Show git log rows in a copyable table."""
+    popup = Toplevel(root)
+    popup.title(f"Git Log - {branch_name}")
+    popup.geometry("820x460")
+    popup.minsize(520, 260)
+    popup.transient(root)
+
+    popup.grid_rowconfigure(1, weight=1)
+    popup.grid_columnconfigure(0, weight=1)
+
+    tk.Label(popup, text=f"Git Log - {branch_name}   ({len(rows)} commits)",
+             font=("Arial", 12, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 6))
+
+    table_wrap = tk.Frame(popup)
+    table_wrap.grid(row=1, column=0, sticky="nsew", padx=10, pady=0)
+    table_wrap.grid_rowconfigure(0, weight=1)
+    table_wrap.grid_columnconfigure(0, weight=1)
+
+    cols = ("hash", "author", "date", "subject")
+    tree = ttk.Treeview(table_wrap, columns=cols, show="headings", selectmode="extended")
+    for c, txt, w, stretch in (
+        ("hash", "Hash", 90, False),
+        ("author", "Author", 140, False),
+        ("date", "Date", 100, False),
+        ("subject", "Subject", 460, True),
+    ):
+        tree.heading(c, text=txt)
+        tree.column(c, width=w, minwidth=60, stretch=stretch, anchor="w")
+
+    vbar = ttk.Scrollbar(table_wrap, orient="vertical", command=tree.yview)
+    hbar = ttk.Scrollbar(table_wrap, orient="horizontal", command=tree.xview)
+    tree.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    vbar.grid(row=0, column=1, sticky="ns")
+    hbar.grid(row=1, column=0, sticky="ew")
+
+    for r in rows:
+        tree.insert("", "end", values=r)
+
+    def _rows_to_text(items):
+        return "\n".join("\t".join(tree.item(i, "values")) for i in items)
+
+    def _copy_selected(_evt=None):
+        sel = tree.selection()
+        if not sel:
+            return
+        popup.clipboard_clear()
+        popup.clipboard_append(_rows_to_text(sel))
+
+    def _copy_hash(_evt=None):
+        sel = tree.selection()
+        if not sel:
+            return
+        popup.clipboard_clear()
+        popup.clipboard_append(" ".join(tree.item(i, "values")[0] for i in sel))
+
+    def _copy_all():
+        popup.clipboard_clear()
+        popup.clipboard_append(_rows_to_text(tree.get_children()))
+
+    def _download_txt():
+        default_name = f"git-log-{branch_name}.txt".replace("/", "-")
+        path = filedialog.asksaveasfilename(
+            parent=popup,
+            title="Save git log as text",
+            defaultextension=".txt",
+            initialfile=default_name,
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            header = "\t".join(("Hash", "Author", "Date", "Subject"))
+            body = _rows_to_text(tree.get_children())
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(header + "\n" + body + "\n")
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e), parent=popup)
+            return
+        messagebox.showinfo("Saved", f"Log written to:\n{path}", parent=popup)
+
+    tree.bind("<Double-1>", _copy_hash)
+    tree.bind("<Control-c>", _copy_selected)
+
+    btn_row = tk.Frame(popup)
+    btn_row.grid(row=2, column=0, sticky="e", padx=10, pady=8)
+    tk.Button(btn_row, text="Copy row(s)", command=_copy_selected).pack(side="left", padx=4)
+    tk.Button(btn_row, text="Copy hash", command=_copy_hash).pack(side="left", padx=4)
+    tk.Button(btn_row, text="Copy all", command=_copy_all).pack(side="left", padx=4)
+    tk.Button(btn_row, text="Download as .txt", command=_download_txt).pack(side="left", padx=4)
+    tk.Button(btn_row, text="Close", command=popup.destroy).pack(side="left", padx=4)
 
 def git_pull_branch():
     global repo
@@ -3786,28 +4462,76 @@ def refresh_workflow_graph():
 
 def show_graph_help():
     """Popup explaining how to read the ASCII workflow graph."""
-    help_text = (
-        "Workflow Graph Help\n\n"
-        "Reading order\n"
-        "  • The graph reads from top to bottom: top = newest commits, bottom = oldest.\n\n"
-        "What you see on the left (ASCII graph)\n"
-        "  • Each '*' is a commit.\n"
-        "  • '|' vertical lines show branch history continuing.\n"
-        "  • '/' and '\\\\' are just connectors: they move branch lines left/right so\n"
-        "    Git can draw splits and merges without overlapping.\n"
-        "  • Lines that have only '|' '/' '\\\\' and no '*' are just connector rows\n"
-        "    (no commit there) – they are the 'gaps' between commits.\n\n"
-        "Colors\n"
-        "  • Black  : normal commits.\n"
-        "  • Red    : merge commits (two branches joined here).\n"
-        "  • Blue   : branch tips (where a branch currently points).\n"
-        "  • Orange : commits whose message mentions 'copy' or 'restore'.\n\n"
-        "Right-hand tables\n"
-        "  • 'Merges' table: shows who merged what, and into which branch.\n"
-        "  • 'Recent Commits' table: shows the last few hundred commits with file counts\n"
-        "    and a best-guess branch name for each commit.\n"
-    )
-    messagebox.showinfo("Workflow Graph Help", help_text)
+    popup = Toplevel(root)
+    popup.title("Workflow Graph Help")
+    popup.geometry("620x600")
+    popup.minsize(460, 400)
+    popup.transient(root)
+    popup.grid_rowconfigure(0, weight=1)
+    popup.grid_columnconfigure(0, weight=1)
+
+    txt = scrolledtext.ScrolledText(popup, wrap="word", font=("Segoe UI", 10),
+                                    padx=16, pady=14, relief="flat",
+                                    background="#ffffff", cursor="arrow")
+    txt.grid(row=0, column=0, sticky="nsew")
+
+    txt.tag_configure("h1", font=("Segoe UI", 15, "bold"), spacing3=10)
+    txt.tag_configure("h2", font=("Segoe UI", 11, "bold"),
+                      spacing1=14, spacing3=6, foreground="#1a4d7a")
+    txt.tag_configure("body", spacing3=4, lmargin1=8, lmargin2=8)
+    txt.tag_configure("bullet", spacing3=4, lmargin1=18, lmargin2=34)
+    txt.tag_configure("mono", font=("Consolas", 10), foreground="#444444")
+    for name, col in (("sw_black", "#000000"), ("sw_red", "#c0392b"),
+                      ("sw_blue", "#2670c4"), ("sw_orange", "#d98014")):
+        txt.tag_configure(name, foreground=col, font=("Segoe UI", 10, "bold"))
+
+    def h1(s):     txt.insert("end", s + "\n", "h1")
+    def h2(s):     txt.insert("end", s + "\n", "h2")
+    def bullet(*segs):
+        txt.insert("end", "•  ", "bullet")
+        for seg in segs:
+            if isinstance(seg, tuple):
+                txt.insert("end", seg[0], (seg[1], "bullet"))
+            else:
+                txt.insert("end", seg, "bullet")
+        txt.insert("end", "\n")
+
+    h1("Workflow Graph Help")
+
+    h2("Reading order")
+    bullet("The graph reads top to bottom: ", ("top = newest", "mono"),
+           " commits, ", ("bottom = oldest", "mono"), ".")
+
+    h2("What you see on the left (ASCII graph)")
+    bullet(("*", "mono"), "  is a commit.")
+    bullet(("|", "mono"), "  vertical lines show branch history continuing.")
+    bullet(("/", "mono"), " and ", ("\\", "mono"),
+           "  are just connectors: they move branch lines left/right so Git can "
+           "draw splits and merges without overlapping.")
+    bullet("Rows with only ", ("| / \\", "mono"),
+           " and no ", ("*", "mono"),
+           "  are connector rows (no commit there) — the 'gaps' between commits.")
+
+    h2("Colors")
+    bullet(("Black", "sw_black"), "  — normal commits.")
+    bullet(("Red", "sw_red"), "  — merge commits (two branches joined here).")
+    bullet(("Blue", "sw_blue"), "  — branch tips (where a branch currently points).")
+    bullet(("Orange", "sw_orange"),
+           "  — commits whose message mentions 'copy' or 'restore'.")
+
+    h2("Right-hand tables")
+    bullet(("Merges", "mono"), " table: who merged what, and into which branch.")
+    bullet(("Recent Commits", "mono"),
+           " table: the last few hundred commits with file counts and a "
+           "best-guess branch name for each commit.")
+
+    txt.configure(state="disabled")
+
+    btn_row = tk.Frame(popup)
+    btn_row.grid(row=1, column=0, sticky="e", padx=12, pady=10)
+    tk.Button(btn_row, text="Close", width=10, command=popup.destroy).pack()
+
+    popup.bind("<Escape>", lambda _e: popup.destroy())
 
 def _find_chromium_browser():
     """Return a path to a Chromium-based browser (Edge preferred, then Chrome/
@@ -4188,14 +4912,51 @@ def _append_terminal_command(text: str):
     terminal_output.see("end")
     terminal_output.config(state="disabled")
 
+# Characters that let a shell chain / redirect / substitute a second command.
+# `git status; ls`, `git log | curl ...`, `git status && calc`, `git status $(whoami)`,
+# backtick substitution and newlines all belong here.
+_SHELL_METACHARS = (";", "&", "|", "`", "$", ">", "<", "\n", "\r", "(", ")")
+
+def _parse_single_git_command(cmd: str):
+    """Validate `cmd` is exactly one git invocation and return its arg list.
+
+    Raises ValueError with a user-facing message otherwise. The returned list is
+    run with shell=False, so even a metacharacter that slipped past the explicit
+    check below is handed to git as a literal argument, never to a shell.
+    """
+    hit = next((ch for ch in _SHELL_METACHARS if ch in cmd), None)
+    if hit is not None:
+        shown = {"\n": "\\n", "\r": "\\r"}.get(hit, hit)
+        raise ValueError(
+            f"'{shown}' is not allowed here. Only a single git command can be run "
+            "(no ';', '&&', '|', redirection or command substitution)."
+        )
+    try:
+        # posix=False so Windows backslash paths aren't mangled; strip the
+        # surrounding quotes it leaves on quoted args (e.g. a commit message)
+        # ourselves.
+        parts = shlex.split(cmd, posix=False)
+    except ValueError as e:
+        raise ValueError(f"Could not parse command: {e}")
+    cleaned = []
+    for p in parts:
+        if len(p) >= 2 and p[0] == p[-1] and p[0] in ("'", '"'):
+            p = p[1:-1]
+        cleaned.append(p)
+    if not cleaned or cleaned[0].lower() != "git":
+        raise ValueError("Only git commands are allowed.")
+    return cleaned
+
 def run_git_command():
     if not _ensure_repo_loaded_for_terminal():
         return
     cmd = terminal_entry.get().strip()
     if not cmd:
         return
-    if not cmd.lower().startswith("git "):
-        messagebox.showwarning("Terminal", "Only git commands are allowed.")
+    try:
+        argv = _parse_single_git_command(cmd)
+    except ValueError as e:
+        messagebox.showwarning("Terminal", str(e))
         return
     if shutil.which("git") is None:
         msg = "Git is not installed in the system. Install it from:\nhttps://git-scm.com/"
@@ -4206,9 +4967,9 @@ def run_git_command():
     _append_terminal_command(f"> {cmd}\n")
     try:
         proc = subprocess.run(
-            cmd,
+            argv,
             cwd=repo.working_dir,
-            shell=True,
+            shell=False,
             text=True,
             capture_output=True
         )
