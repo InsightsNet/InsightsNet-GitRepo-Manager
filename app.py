@@ -4328,10 +4328,11 @@ def _collect_workflow_data(r: Repo):
         msg = c.message.splitlines()[0] if (c.message or "").splitlines() else ""
         branch = _branch_hint_for_commit(r, c.hexsha) or ""
         try:
-            files_changed = len(c.stats.files or {})
+            changed = list(c.stats.files or {})
         except Exception:
-            files_changed = 0
-        commits_rows.append((short_sha, when, author, branch, files_changed, msg))
+            changed = []
+        file_names = ", ".join(os.path.basename(str(p)) for p in changed)
+        commits_rows.append((short_sha, when, author, branch, len(changed), file_names, msg))
 
     # --- Build Merges rows ---
     try:
@@ -4459,6 +4460,109 @@ def refresh_workflow_graph_async():
 def refresh_workflow_graph():
     # Backwards-compatible entry point (use async to keep UI responsive)
     refresh_workflow_graph_async()
+
+def _commit_file_rows(r: Repo, c):
+    """Return (status, path, +lines, -lines) for every file a commit touched.
+
+    Diffs against the first parent (same basis as the FILES count), or
+    against the empty tree for a root commit."""
+    args = ["-r", "--no-commit-id", "-M", "--name-status"]
+    if c.parents:
+        out = r.git.diff_tree(*args, c.parents[0].hexsha, c.hexsha)
+    else:
+        out = r.git.diff_tree("--root", *args, c.hexsha)
+    try:
+        stats = c.stats.files or {}
+    except Exception:
+        stats = {}
+
+    rows = []
+    for line in (out or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        code = parts[0][:1]
+        status = _GIT_XY_DESC.get(code, code)
+        if code in ("R", "C") and len(parts) >= 3:
+            path = f"{parts[1]} -> {parts[2]}"
+            st = stats.get(parts[2]) or stats.get(f"{parts[1]} => {parts[2]}") or {}
+        else:
+            path = parts[1]
+            st = stats.get(path) or {}
+        rows.append((status, path, st.get("insertions", ""), st.get("deletions", "")))
+    return rows
+
+def show_commit_files(_evt=None):
+    """Popup listing the files changed in the selected Recent Commits row."""
+    if not repo:
+        return
+    sel = commits_table.selection()
+    if not sel:
+        return
+    values = commits_table.item(sel[0], "values")
+    if not values:
+        return
+    short_sha, msg = values[0], values[-1]
+    try:
+        c = repo.commit(short_sha)
+        rows = _commit_file_rows(repo, c)
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to read files for {short_sha}:\n{e}")
+        return
+
+    popup = Toplevel(root)
+    popup.title(f"Files in commit {short_sha}")
+    popup.geometry("760x420")
+    popup.minsize(480, 240)
+    popup.transient(root)
+    popup.grid_rowconfigure(2, weight=1)
+    popup.grid_columnconfigure(0, weight=1)
+
+    tk.Label(popup, text=f"Commit {short_sha}   ({len(rows)} file(s))",
+             font=("Arial", 12, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 2))
+    tk.Label(popup, text=msg, anchor="w", justify="left", wraplength=720)\
+      .grid(row=1, column=0, sticky="w", padx=10, pady=(0, 6))
+
+    table_wrap = tk.Frame(popup)
+    table_wrap.grid(row=2, column=0, sticky="nsew", padx=10)
+    table_wrap.grid_rowconfigure(0, weight=1)
+    table_wrap.grid_columnconfigure(0, weight=1)
+
+    cols = ("status", "file", "added", "removed")
+    tree = ttk.Treeview(table_wrap, columns=cols, show="headings", selectmode="extended")
+    for col, txt, w, stretch in (
+        ("status", "Status", 100, False),
+        ("file", "File", 480, True),
+        ("added", "+Lines", 70, False),
+        ("removed", "-Lines", 70, False),
+    ):
+        tree.heading(col, text=txt)
+        tree.column(col, width=w, minwidth=50, stretch=stretch, anchor="w")
+
+    vbar = ttk.Scrollbar(table_wrap, orient="vertical", command=tree.yview)
+    hbar = ttk.Scrollbar(table_wrap, orient="horizontal", command=tree.xview)
+    tree.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    vbar.grid(row=0, column=1, sticky="ns")
+    hbar.grid(row=1, column=0, sticky="ew")
+
+    if rows:
+        for row in rows:
+            tree.insert("", "end", values=row)
+    else:
+        tree.insert("", "end", values=("", "No file changes in this commit", "", ""))
+
+    def _copy_paths(_evt=None):
+        items = tree.selection() or tree.get_children()
+        paths = [tree.item(i, "values")[1] for i in items]
+        popup.clipboard_clear()
+        popup.clipboard_append("\n".join(paths))
+
+    tree.bind("<Control-c>", _copy_paths)
+    btns = tk.Frame(popup)
+    btns.grid(row=3, column=0, sticky="e", padx=10, pady=10)
+    tk.Button(btns, text="Copy file names", command=_copy_paths).pack(side="left", padx=5)
+    tk.Button(btns, text="Close", command=popup.destroy).pack(side="left", padx=5)
 
 def show_graph_help():
     """Popup explaining how to read the ASCII workflow graph."""
@@ -5364,12 +5468,13 @@ merges_frame.grid_columnconfigure(0, weight=1)
 
 commits_frame = tk.Frame(right_col, bd=1, relief="sunken")
 commits_frame.grid(row=1, column=0, sticky="nsew")
-tk.Label(commits_frame, text="Recent Commits", font=("Arial", 10, "bold"))\
+tk.Label(commits_frame, text="Recent Commits   (double-click a commit to see its files)",
+         font=("Arial", 10, "bold"))\
   .grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 6))
 
-commits_cols = ("sha", "date", "author", "branch", "files", "message")
+commits_cols = ("sha", "date", "author", "branch", "files", "file names", "message")
 commits_table = ttk.Treeview(commits_frame, columns=commits_cols, show="headings")
-for col, w in zip(commits_cols, (90, 90, 160, 110, 70, 600)):
+for col, w in zip(commits_cols, (90, 90, 160, 110, 50, 260, 500)):
     commits_table.heading(col, text=col.upper())
     commits_table.column(col, width=w, anchor="w")
 
@@ -5377,6 +5482,8 @@ commits_y = ttk.Scrollbar(commits_frame, orient="vertical", command=commits_tabl
 commits_x = ttk.Scrollbar(commits_frame, orient="horizontal", command=commits_table.xview)
 commits_table.configure(yscrollcommand=commits_y.set, xscrollcommand=commits_x.set)
 commits_table.grid(row=1, column=0, sticky="nsew", padx=8)
+commits_table.bind("<Double-1>", show_commit_files)
+commits_table.bind("<Return>", show_commit_files)
 commits_y.grid(row=1, column=1, sticky="ns")
 commits_x.grid(row=2, column=0, sticky="ew", padx=8, pady=(0,8))
 commits_frame.grid_rowconfigure(1, weight=1)
@@ -5394,7 +5501,7 @@ except Exception:
 
 def smart_pdf_name():
     base = "igrm_User_Guide"
-    ver = "v0.26"
+    ver = "v0.32"
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
     repo_name = ""
     try:
@@ -5432,7 +5539,7 @@ tk.Label(
 tk.Button(about_tab, text="Download User Guide (PDF)", command=download_pdf).pack(pady=10)
 tk.Label(
     about_tab,
-    text="-----------------------------------------\nInsightsNet GitRepo Manager\nVersion 0.30\n© 2026",
+    text="-----------------------------------------\nInsightsNet GitRepo Manager\nVersion 0.32\n© 2026",
     font=("Arial", 12),
     pady=(20)
 ).pack()
