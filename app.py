@@ -4122,6 +4122,23 @@ def _show_pre_commit_summary(remote_summary: str, local_summary: str, final_summ
     root.wait_window(popup)
     return result["ok"]
 
+def _split_diff_by_file(diff_text: str) -> list[tuple[str, str]]:
+    """Split a multi-file unified diff into (path, chunk) pairs, one per 'diff --git' header."""
+    chunks = []
+    path, lines = None, []
+    for line in (diff_text or "").splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if lines:
+                chunks.append((path or "", "".join(lines)))
+            header = line[len("diff --git "):].strip()
+            path = header.rsplit(" b/", 1)[-1].strip('"') if " b/" in header else header
+            lines = [line]
+        else:
+            lines.append(line)
+    if lines:
+        chunks.append((path or "", "".join(lines)))
+    return chunks
+
 def _open_simple_diff_window(title: str, subtitle: str, diff_text: str, parent=None):
     popup = Toplevel(parent or root)
     popup.title(title)
@@ -4140,14 +4157,34 @@ def _open_simple_diff_window(title: str, subtitle: str, diff_text: str, parent=N
     if subtitle:
         tk.Label(popup, text=subtitle, font=("Arial", 9)).grid(row=0, column=0, sticky="e", padx=10, pady=(10, 2))
 
-    txt = scrolledtext.ScrolledText(popup, wrap="none")
-    txt.grid(row=1, column=0, sticky="nsew", padx=10, pady=0)
-    hbar = tk.Scrollbar(popup, orient="horizontal", command=txt.xview)
-    hbar.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
-    txt.configure(xscrollcommand=hbar.set)
+    notebook = ttk.Notebook(popup)
+    notebook.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
 
-    _colorize_diff_text(txt, diff_text or "(no changes)")
-    txt.configure(state="disabled")
+    def _add_diff_tab(tab_title: str, content: str, path_label: str = ""):
+        tab = tk.Frame(notebook)
+        tab.grid_rowconfigure(1, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+        if path_label:
+            tk.Label(tab, text=path_label, font=("Arial", 9, "bold")).grid(
+                row=0, column=0, sticky="w", padx=4, pady=(4, 2)
+            )
+        txt = scrolledtext.ScrolledText(tab, wrap="none")
+        txt.grid(row=1, column=0, sticky="nsew", padx=4, pady=0)
+        hbar = tk.Scrollbar(tab, orient="horizontal", command=txt.xview)
+        hbar.grid(row=2, column=0, sticky="ew", padx=4, pady=(0, 4))
+        txt.configure(xscrollcommand=hbar.set)
+        _colorize_diff_text(txt, content or "(no changes)")
+        txt.configure(state="disabled")
+        notebook.add(tab, text=tab_title)
+
+    file_chunks = _split_diff_by_file(diff_text)
+    if len(file_chunks) > 1:
+        _add_diff_tab(f"All ({len(file_chunks)})", diff_text)
+    for path, chunk in file_chunks:
+        _add_diff_tab(os.path.basename(path) or "File", chunk, path)
+    if not file_chunks:
+        _add_diff_tab("All", diff_text)
+
     try:
         popup.grab_set()
     except Exception:
