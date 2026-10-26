@@ -4,7 +4,7 @@
 🚀 InsightsNet GitRepo Manager
 
 Welcome to InsightsNet GitRepo Manager!
-This tool (currently in beta(version 0.32)) has been developed by the InsightsNet team at the Technical University of Darmstadt.
+This tool (currently in beta(version 0.33)) has been developed by the InsightsNet team at the Technical University of Darmstadt.
 
 🎯 Purpose
 

@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox, Toplevel
+from tkinter import filedialog, messagebox, Toplevel, simpledialog
 from tkinter import ttk
 from tkinter import scrolledtext
 from PIL import Image, ImageTk
@@ -2681,16 +2681,6 @@ def _ensure_ssh_host_trusted(repo_url: str) -> bool:
 
     return True
 
-def fetch_all_and_prune():
-    """Convenience: fetch --all --prune and refresh the dropdown."""
-    try:
-        if _has_remote_origin():
-            repo.git.fetch('--all', '--prune')
-        list_branches(repo.working_dir if repo else None)
-        messagebox.showinfo("Fetch", "Fetched and pruned remotes. Branch list refreshed.")
-    except Exception as e:
-        messagebox.showerror("Fetch", f"Fetch failed:\n{e}")
-
 # =============== Repo / Branch / Commit logic ===============
 
 def browse_folder():
@@ -2935,8 +2925,12 @@ def clone_repo():
     task()
 
 def list_branches(repo_path=None):
-    """Populate branch dropdown with local + remote branches (any remote)."""
-    global repo, branch_var, branch_dropdown
+    """Populate branch dropdown with local + remote branches (any remote).
+
+    The dropdown is filled at once from what is already known locally, then a
+    fetch --prune runs in the background and the list is rebuilt when it ends,
+    so the window never freezes on a slow network."""
+    global repo
 
     repo_path = repo_path or clone_dir_entry.get()
     if not repo_path or not os.path.exists(repo_path):
@@ -2945,15 +2939,37 @@ def list_branches(repo_path=None):
 
     try:
         repo = Repo(repo_path)
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to list branches:\n{e}")
+        _update_terminal_prompt()
+        return
 
-        # Fetch/prune on the primary remote if present
-        try:
-            r = _get_primary_remote()
-            if r:
-                r.fetch(prune=True)
-        except Exception:
-            pass
+    _populate_branch_dropdown()
+    _update_terminal_prompt()
 
+    r = _get_primary_remote()
+    if not r or _git_op_busy:
+        return  # nothing to fetch, or another operation is using the network
+    rp = repo
+
+    def work():
+        rp.git.fetch("--prune", r.name)
+
+    def done(_res, err):
+        if repo is not rp:
+            return  # a different repository was loaded meanwhile
+        if err:
+            # Offline / auth problems: keep the list built from local data.
+            git_ops_status_label.config(text="Could not reach the remote - branch list may be outdated.")
+            return
+        _populate_branch_dropdown(quiet=True)
+
+    _run_git_op("Fetching branches", work, done)
+
+def _populate_branch_dropdown(quiet=False):
+    """(Re)build the branch dropdown from local branches + cached remote refs."""
+    global branch_dropdown
+    try:
         local = {str(h) for h in getattr(repo, "branches", [])}
 
         # Remote branches (strip '<remote>/' prefix), ignore HEAD
@@ -2974,7 +2990,8 @@ def list_branches(repo_path=None):
 
         all_names = sorted(local | remote)
         if not all_names:
-            messagebox.showwarning("Branches", "No branches found (local or remote).")
+            if not quiet:
+                messagebox.showwarning("Branches", "No branches found (local or remote).")
             return
 
         try:
@@ -3005,7 +3022,6 @@ def list_branches(repo_path=None):
 
     except Exception as e:
         messagebox.showerror("Error", f"Failed to list branches:\n{e}")
-    _update_terminal_prompt()
 
 def switch_branch():
     """Checkout local branch, or create tracking branch from <remote>/<name> if missing."""
@@ -3033,43 +3049,352 @@ def switch_branch():
         _prefill_auth_fields()
     except Exception as e:
         messagebox.showerror("Error", f"Failed to switch branch:\n{e}")
+        # Put the dropdown back on the branch that is really checked out, so
+        # Pull / View Log never act on a branch we failed to switch to.
+        current = _current_branch_name()
+        if current and current != target:
+            branch_var.set(current)
 
 def refresh_branches():
     list_branches()
 
-def git_pull():
-    global repo
+# ---- Background runner for the Git Operations buttons ----
+# Fetch / pull / push talk to the server and can take a while (e.g. on VPN), so
+# they run off the UI thread. Only one runs at a time; the buttons are disabled
+# and a "Working..." line is shown until it finishes.
+_git_op_buttons = []
+_git_op_busy = False
+
+def _set_git_ops_busy(label):
+    state = "disabled" if label else "normal"
+    for b in _git_op_buttons:
+        try:
+            b.config(state=state)
+        except Exception:
+            pass
+    try:
+        git_ops_status_label.config(text=f"{label}..." if label else "")
+    except Exception:
+        pass
+
+def _run_git_op(label, work, done):
+    """Run work() in a thread (no Tk calls inside!), then done(result, error)
+    on the UI thread."""
+    global _git_op_busy
+    if _git_op_busy:
+        messagebox.showinfo("Busy", "Another Git operation is still running. Please wait.")
+        return
+    _git_op_busy = True
+    _set_git_ops_busy(label)
+
+    def task():
+        try:
+            result, err = work(), None
+        except Exception as e:
+            result, err = None, e
+
+        def finish():
+            global _git_op_busy
+            _git_op_busy = False
+            _set_git_ops_busy(None)
+            if app_closing or not root.winfo_exists():
+                return
+            done(result, err)
+
+        _post_ui(finish)
+
+    threading.Thread(target=task, daemon=True).start()
+
+def _current_branch_and_remote():
+    """Checks shared by Pull / Push / Incoming-Outgoing.
+    Returns (remote, branch), or (None, None) after telling the user why."""
     if not repo:
         messagebox.showwarning("Error", "No repository loaded.")
-        return
+        return None, None
     r = _get_primary_remote()
     if not r:
         messagebox.showwarning("Error", "No remote configured.")
-        return
+        return None, None
+    branch = _current_branch_name()
+    if not branch:
+        messagebox.showwarning("Error", "You are not on a branch (detached HEAD). Pick a branch first.")
+        return None, None
+    return r, branch
+
+def _upstream_ref(rp, r, branch):
+    """The remote branch the checked-out branch syncs with: its tracking branch
+    if set, else <remote>/<branch>. Returns '' if neither exists."""
     try:
-        r.pull()
-        messagebox.showinfo("Success", f"Repository updated via git pull from '{r.name}'.")
-    except Exception as e:
-        messagebox.showerror("Error", f"Git Pull failed:\n{e}")
+        tracking = rp.active_branch.tracking_branch()
+    except Exception:
+        tracking = None
+    candidates = ([str(tracking)] if tracking else []) + [f"{r.name}/{branch}"]
+    for ref in candidates:
+        try:
+            rp.git.rev_parse("--verify", "--quiet", ref)
+            return ref
+        except Exception:
+            continue
+    return ""
+
+_GIT_LOG_FMT = "%h\x1f%an\x1f%ad\x1f%s"
+
+def _parse_log_rows(log_text):
+    """Split `git log --pretty=format:_GIT_LOG_FMT` output into 4-tuples."""
+    rows = []
+    for line in (log_text or "").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\x1f")
+        while len(parts) < 4:
+            parts.append("")
+        rows.append(tuple(parts[:4]))
+    return rows
+
+def _short_list(paths, limit=15):
+    shown = [f"  • {p}" for p in paths[:limit]]
+    if len(paths) > limit:
+        shown.append(f"  ...and {len(paths) - limit} more")
+    return "\n".join(shown)
+
+def _show_text_result(title, header, body):
+    """Small scrollable popup for command results."""
+    popup = Toplevel(root)
+    popup.title(title)
+    popup.geometry("640x400")
+    popup.minsize(420, 240)
+    popup.transient(root)
+    tk.Label(popup, text=header, font=("Arial", 11, "bold"), justify="left",
+             wraplength=600).pack(anchor="w", padx=12, pady=(12, 6))
+    t = scrolledtext.ScrolledText(popup, wrap="none", font=("Consolas", 9), height=14)
+    t.pack(fill="both", expand=True, padx=12)
+    t.insert("1.0", body or "(no output)")
+    t.configure(state="disabled")
+    tk.Button(popup, text="Close", command=popup.destroy).pack(anchor="e", padx=12, pady=10)
+    popup.bind("<Escape>", lambda _e: popup.destroy())
 
 def git_fetch_status():
-    global repo
+    if not repo:
+        messagebox.showwarning("Error", "No repository loaded.")
+        return
+    rp = repo
+    r = _get_primary_remote()
+
+    def work():
+        if r:
+            rp.git.fetch(r.name)
+        raw = rp.git.status()
+        try:
+            porc = rp.git.status("--porcelain=v2", "--branch")
+        except Exception:
+            porc = ""
+        return raw, porc
+
+    def done(res, err):
+        if err:
+            messagebox.showerror("Error", f"Git fetch/status failed:\n{err}")
+            return
+        _show_git_status(*res)
+
+    _run_git_op("Fetching status", work, done)
+
+# ---- Incoming / Outgoing ----
+
+def git_incoming_outgoing():
+    """Show commits a Pull would bring in and commits a Push would send."""
+    r, branch = _current_branch_and_remote()
+    if not r:
+        return
+    rp = repo
+
+    def work():
+        rp.git.fetch(r.name)
+        upstream = _upstream_ref(rp, r, branch)
+        fmt = f"--pretty=format:{_GIT_LOG_FMT}"
+        if upstream:
+            incoming = _parse_log_rows(rp.git.log(fmt, "--date=short", f"HEAD..{upstream}"))
+            outgoing = _parse_log_rows(rp.git.log(fmt, "--date=short", f"{upstream}..HEAD"))
+        else:
+            # Never pushed: everything not on any remote branch is outgoing.
+            incoming = []
+            outgoing = _parse_log_rows(rp.git.log(fmt, "--date=short", "HEAD", "--not", "--remotes"))
+        return upstream, incoming, outgoing
+
+    def done(res, err):
+        if err:
+            messagebox.showerror("Incoming / Outgoing", f"Could not compare with the remote:\n{err}")
+            return
+        _show_incoming_outgoing(branch, r.name, *res)
+
+    _run_git_op("Comparing with remote", work, done)
+
+def _show_incoming_outgoing(branch, remote_name, upstream, incoming, outgoing):
+    popup = Toplevel(root)
+    popup.title(f"Incoming / Outgoing - {branch}")
+    popup.geometry("820x560")
+    popup.minsize(520, 360)
+    popup.transient(root)
+    popup.grid_columnconfigure(0, weight=1)
+
+    def section(row, title, hint, rows, empty_text):
+        tk.Label(popup, text=title, font=("Arial", 12, "bold")).grid(
+            row=row, column=0, sticky="w", padx=10, pady=(10, 0))
+        tk.Label(popup, text=hint, font=("Arial", 9), fg="#555555").grid(
+            row=row + 1, column=0, sticky="w", padx=10)
+        wrap = tk.Frame(popup)
+        wrap.grid(row=row + 2, column=0, sticky="nsew", padx=10, pady=(4, 0))
+        popup.grid_rowconfigure(row + 2, weight=1)
+        wrap.grid_rowconfigure(0, weight=1)
+        wrap.grid_columnconfigure(0, weight=1)
+        tree = ttk.Treeview(wrap, columns=("hash", "author", "date", "subject"),
+                            show="headings", height=7)
+        for c, txt, w, stretch in (("hash", "Hash", 90, False), ("author", "Author", 140, False),
+                                   ("date", "Date", 100, False), ("subject", "Subject", 440, True)):
+            tree.heading(c, text=txt)
+            tree.column(c, width=w, minwidth=60, stretch=stretch, anchor="w")
+        vbar = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vbar.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vbar.grid(row=0, column=1, sticky="ns")
+        for rw in rows:
+            tree.insert("", "end", values=rw)
+        if not rows:
+            tree.insert("", "end", values=("", "", "", empty_text))
+
+    if upstream:
+        in_hint = f"Commits on '{upstream}' that Pull will bring into '{branch}'."
+        out_hint = f"Commits on '{branch}' that Push will send to '{upstream}'."
+    else:
+        in_hint = f"'{branch}' does not exist on '{remote_name}' yet, so there is nothing to pull."
+        out_hint = f"Local-only commits. Push will create '{remote_name}/{branch}' with them."
+
+    section(0, f"Incoming  ({len(incoming)})", in_hint, incoming, "Nothing to pull - up to date")
+    section(3, f"Outgoing  ({len(outgoing)})", out_hint, outgoing, "Nothing to push")
+    tk.Button(popup, text="Close", command=popup.destroy).grid(
+        row=6, column=0, sticky="e", padx=10, pady=10)
+    popup.bind("<Escape>", lambda _e: popup.destroy())
+
+# ---- Stash ----
+
+def git_stash_save():
+    if not repo:
+        messagebox.showwarning("Error", "No repository loaded.")
+        return
+    if _git_op_busy:
+        messagebox.showinfo("Busy", "Another Git operation is still running. Please wait.")
+        return
+    if not repo.is_dirty(untracked_files=True):
+        messagebox.showinfo("Stash", "There are no local changes to stash.")
+        return
+    note = simpledialog.askstring("Stash changes",
+                                  "Optional note for this stash (what were you working on?):",
+                                  parent=root)
+    if note is None:
+        return
+    args = ["push", "--include-untracked"] + (["-m", note.strip()] if note.strip() else [])
+    try:
+        repo.git.stash(*args)
+    except Exception as e:
+        messagebox.showerror("Stash", f"Git stash failed:\n{e}")
+        return
+    messagebox.showinfo("Stash", "Your changes are saved in the stash and the working folder is clean.\n\n"
+                                 "Use Stash > Apply latest stash to bring them back.")
+
+def git_stash_pop(ref="stash@{0}", parent=None):
+    """Re-apply a stash and remove it. Returns True on success."""
+    if not repo:
+        messagebox.showwarning("Error", "No repository loaded.", parent=parent)
+        return False
+    if _git_op_busy:
+        messagebox.showinfo("Busy", "Another Git operation is still running. Please wait.", parent=parent)
+        return False
+    try:
+        if not repo.git.stash("list").strip():
+            messagebox.showinfo("Stash", "The stash is empty.", parent=parent)
+            return False
+        repo.git.stash("pop", ref)
+    except Exception as e:
+        messagebox.showerror(
+            "Stash",
+            f"Could not fully apply {ref}:\n{e}\n\n"
+            "If it reports conflicts, fix the conflicted files; the stash is kept "
+            "until you drop it from Stash > View stashes.",
+            parent=parent)
+        return False
+    messagebox.showinfo("Stash", f"Applied and removed {ref}.", parent=parent)
+    return True
+
+def git_stash_list():
     if not repo:
         messagebox.showwarning("Error", "No repository loaded.")
         return
     try:
-        r = _get_primary_remote()
-        if r:
-            r.fetch()
-        raw = repo.git.status()
-        try:
-            porc = repo.git.status("--porcelain=v2", "--branch")
-        except Exception:
-            porc = ""
+        out = repo.git.stash("list", "--pretty=format:%gd\x1f%cr\x1f%gs")
     except Exception as e:
-        messagebox.showerror("Error", f"Git fetch/status failed:\n{e}")
+        messagebox.showerror("Stash", f"Could not read the stash:\n{e}")
         return
-    _show_git_status(raw, porc)
+
+    popup = Toplevel(root)
+    popup.title("Stashes")
+    popup.geometry("680x340")
+    popup.minsize(440, 220)
+    popup.transient(root)
+    popup.grid_rowconfigure(1, weight=1)
+    popup.grid_columnconfigure(0, weight=1)
+    tk.Label(popup, text="Saved stashes (newest first)", font=("Arial", 12, "bold")).grid(
+        row=0, column=0, sticky="w", padx=10, pady=(10, 6))
+
+    tree = ttk.Treeview(popup, columns=("ref", "when", "message"), show="headings", selectmode="browse")
+    for c, txt, w, stretch in (("ref", "Stash", 90, False), ("when", "When", 110, False),
+                               ("message", "Message", 420, True)):
+        tree.heading(c, text=txt)
+        tree.column(c, width=w, minwidth=60, stretch=stretch, anchor="w")
+    tree.grid(row=1, column=0, sticky="nsew", padx=10)
+
+    def _fill(text):
+        tree.delete(*tree.get_children())
+        for line in (text or "").splitlines():
+            parts = (line.split("\x1f") + ["", ""])[:3]
+            tree.insert("", "end", iid=parts[0], values=parts)
+
+    _fill(out)
+
+    def _reload():
+        try:
+            _fill(repo.git.stash("list", "--pretty=format:%gd\x1f%cr\x1f%gs"))
+        except Exception:
+            pass
+
+    def _selected():
+        sel = tree.selection()
+        if not sel:
+            messagebox.showinfo("Stash", "Select a stash first.", parent=popup)
+        return sel[0] if sel else ""
+
+    def _apply():
+        ref = _selected()
+        if ref and git_stash_pop(ref, parent=popup):
+            _reload()
+
+    def _drop():
+        ref = _selected()
+        if not ref:
+            return
+        if not messagebox.askyesno("Drop stash", f"Permanently delete {ref}?\nThose changes will be lost.",
+                                   parent=popup):
+            return
+        try:
+            repo.git.stash("drop", ref)
+        except Exception as e:
+            messagebox.showerror("Stash", f"Drop failed:\n{e}", parent=popup)
+        _reload()
+
+    btns = tk.Frame(popup)
+    btns.grid(row=2, column=0, sticky="e", padx=10, pady=10)
+    tk.Button(btns, text="Apply & remove", command=_apply).pack(side="left", padx=4)
+    tk.Button(btns, text="Drop", command=_drop).pack(side="left", padx=4)
+    tk.Button(btns, text="Close", command=popup.destroy).pack(side="left", padx=4)
+    popup.bind("<Escape>", lambda _e: popup.destroy())
 
 
 _GIT_XY_DESC = {
@@ -3203,27 +3528,21 @@ def git_log_branch():
     if not repo:
         messagebox.showwarning("Error", "No repository loaded.")
         return
-    branch_name = branch_var.get()
-    fmt = "%h\x1f%an\x1f%ad\x1f%s"
+    # The checked-out branch, not the dropdown (it can differ if a switch failed).
+    branch_name = _current_branch_name() or branch_var.get()
+    fmt = f"--pretty=format:{_GIT_LOG_FMT}"
     try:
         try:
-            log = repo.git.log(branch_name, f"--pretty=format:{fmt}", "--date=short")
+            log = repo.git.log(branch_name, fmt, "--date=short", "--max-count=500")
         except Exception:
             r = _get_primary_remote()
             rb = f"{r.name}/{branch_name}" if r else branch_name
-            log = repo.git.log(rb, f"--pretty=format:{fmt}", "--date=short")
+            log = repo.git.log(rb, fmt, "--date=short", "--max-count=500")
     except Exception as e:
         messagebox.showerror("Error", f"Git log failed:\n{e}")
         return
 
-    rows = []
-    for line in (log or "").splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\x1f")
-        while len(parts) < 4:
-            parts.append("")
-        rows.append(tuple(parts[:4]))
+    rows = _parse_log_rows(log)
 
     if not rows:
         messagebox.showinfo(f"Git Log - {branch_name}", "No commits found.")
@@ -3325,40 +3644,218 @@ def _show_git_log_table(branch_name, rows):
     tk.Button(btn_row, text="Download as .txt", command=_download_txt).pack(side="left", padx=4)
     tk.Button(btn_row, text="Close", command=popup.destroy).pack(side="left", padx=4)
 
-def git_pull_branch():
-    global repo
-    if not repo:
-        messagebox.showwarning("Error", "No repository loaded.")
-        return
-    r = _get_primary_remote()
-    if not r:
-        messagebox.showwarning("Error", "No remote configured.")
-        return
-    branch_name = branch_var.get()
-    try:
-        repo.git.pull(r.name, branch_name)
-        messagebox.showinfo("Success", f"Updated branch {branch_name} from '{r.name}'")
-    except Exception as e:
-        messagebox.showerror("Error", f"Git pull failed:\n{e}")
+# ---- Pull ----
+# Always merge explicitly: without pull.rebase configured, newer git refuses to
+# pull when local and remote have both moved on ("divergent branches").
+_PULL_STRATEGY = "--no-rebase"
 
-def git_push():
-    global repo
-    if not repo:
-        messagebox.showwarning("Error", "No repository loaded.")
-        return
-    r = _get_primary_remote()
+def _porcelain_paths(rp):
+    """(untracked, changed) path sets from `git status`, NUL-separated so
+    paths with spaces / non-ASCII come through unquoted."""
+    untracked, changed = set(), set()
+    entries = rp.git.status("--porcelain", "-z", "--untracked-files=all").split("\0")
+    i = 0
+    while i < len(entries):
+        e = entries[i]
+        i += 1
+        if len(e) < 4:
+            continue
+        xy, path = e[:2], e[3:]
+        if xy == "??":
+            untracked.add(path)
+        else:
+            changed.add(path)
+            if xy[0] in "RC":
+                i += 1  # the next entry is the rename/copy source path
+    return untracked, changed
+
+def _free_backup_path(src):
+    dst = f"{src}.local-backup"
+    n = 1
+    while os.path.exists(dst):
+        dst = f"{src}.local-backup{n}"
+        n += 1
+    return dst
+
+def git_pull_branch():
+    """Pull the checked-out branch: check first, clear blockers with the
+    user's OK, then pull and show what changed."""
+    r, branch = _current_branch_and_remote()
     if not r:
-        messagebox.showwarning("Error", "No remote configured.")
         return
-    branch_name = _current_branch_name() or branch_var.get().strip()
-    if not branch_name:
-        messagebox.showwarning("Error", "No branch selected.")
+    rp = repo
+
+    def check():
+        rp.git.fetch(r.name)
+        upstream = _upstream_ref(rp, r, branch)
+        if not upstream:
+            return {"upstream": ""}
+        ahead, behind = (int(n) for n in
+                         rp.git.rev_list("--left-right", "--count", f"HEAD...{upstream}").split())
+        info = {"upstream": upstream, "ahead": ahead, "behind": behind,
+                "untracked_clash": [], "changed_clash": []}
+        if behind:
+            incoming = set(p for p in rp.git.diff("--name-only", "-z", f"HEAD...{upstream}").split("\0") if p)
+            untracked, changed = _porcelain_paths(rp)
+            info["untracked_clash"] = sorted(untracked & incoming)
+            info["changed_clash"] = sorted(changed & incoming)
+        return info
+
+    _run_git_op("Checking remote", check,
+                lambda info, err: _pull_after_check(rp, r, branch, info, err))
+
+def _pull_after_check(rp, r, branch, info, err):
+    if err:
+        messagebox.showerror("Pull", f"Could not check the remote:\n{err}")
         return
-    try:
-        out = repo.git.push(r.name, branch_name)
-        messagebox.showinfo("Git Push", out or f"Pushed {branch_name} to '{r.name}'.")
-    except Exception as e:
-        messagebox.showerror("Git Push", f"Git push failed:\n{e}")
+    upstream = info["upstream"]
+    if not upstream:
+        messagebox.showinfo("Pull", f"Branch '{branch}' does not exist on '{r.name}' yet, "
+                                    "so there is nothing to pull.\n\nUse Push to publish it first.")
+        return
+    if info["behind"] == 0:
+        msg = f"Already up to date with '{upstream}'."
+        if info["ahead"]:
+            msg += f"\n\nYou have {info['ahead']} local commit(s) not pushed yet - use Push."
+        messagebox.showinfo("Pull", msg)
+        return
+
+    rename = info["untracked_clash"]
+    if rename and not messagebox.askyesno(
+            "Pull - untracked files in the way",
+            "These files exist on your PC but were never committed, and the remote "
+            "now has files with the same names:\n\n"
+            f"{_short_list(rename)}\n\n"
+            "Git cannot pull while they are in the way.\n\n"
+            "Rename them to '<name>.local-backup' and continue?\n"
+            "(Compare with the pulled version afterwards and delete the backup.)"):
+        return
+
+    stash = bool(info["changed_clash"])
+    if stash and not messagebox.askyesno(
+            "Pull - local changes in the way",
+            "You have uncommitted changes in files that the pull also changes:\n\n"
+            f"{_short_list(info['changed_clash'])}\n\n"
+            "Stash them (save aside), pull, then restore them automatically?\n\n"
+            "If both sides changed the same lines you will get conflicts to resolve."):
+        return
+
+    remote_name, remote_head = upstream.split("/", 1)
+    behind = info["behind"]
+
+    def work():
+        notes = []
+        for p in rename:
+            src = os.path.join(rp.working_dir, p)
+            dst = _free_backup_path(src)
+            os.rename(src, dst)
+            notes.append(f"Renamed {p}  ->  {os.path.relpath(dst, rp.working_dir)}")
+        stashed = False
+        if stash:
+            out = rp.git.stash("push", "-m", f"autostash: before pull of {upstream}")
+            stashed = "No local changes to save" not in (out or "")
+        before = rp.head.commit.hexsha
+        try:
+            out = rp.git.pull(_PULL_STRATEGY, remote_name, remote_head)
+        except Exception as e:
+            try:
+                conflicts = [p for p in rp.git.diff("--name-only", "--diff-filter=U").splitlines() if p]
+            except Exception:
+                conflicts = []
+            # Leave any stash in place so the user's changes are never lost.
+            return {"notes": notes, "pull_error": e, "conflicts": conflicts, "stashed": stashed}
+        pop_error = None
+        if stashed:
+            try:
+                rp.git.stash("pop")
+            except Exception as e:
+                pop_error = e
+        after = rp.head.commit.hexsha
+        stat = rp.git.diff("--stat", before, after) if before != after else ""
+        return {"notes": notes, "out": out, "stat": stat, "pop_error": pop_error}
+
+    _run_git_op("Pulling", work,
+                lambda res, err2: _show_pull_result(upstream, behind, res, err2))
+
+def _show_pull_result(upstream, behind, res, err):
+    if err:
+        messagebox.showerror("Pull failed", f"Git pull failed:\n{err}")
+        return
+    refresh_workflow_graph()
+    notes = "\n".join(res["notes"])
+
+    if res.get("pull_error"):
+        if res["conflicts"]:
+            msg = ("The pull stopped with merge conflicts in:\n\n"
+                   f"{_short_list(res['conflicts'])}\n\n"
+                   "Open these files, fix the <<<<<<< / >>>>>>> sections, then commit.\n"
+                   "To cancel the merge instead, run 'git merge --abort' in the Terminal tab.")
+        else:
+            msg = f"Git pull failed:\n{res['pull_error']}"
+        if res["stashed"]:
+            msg += "\n\nYour local changes are safe in the stash (Stash > Apply latest stash)."
+        if notes:
+            msg += f"\n\n{notes}"
+        messagebox.showerror("Pull", msg)
+        return
+
+    header = f"Pulled {behind} commit(s) from '{upstream}'."
+    if res["pop_error"]:
+        header += ("  Your stashed changes were restored with conflicts - fix them; "
+                   "the stash is kept until you drop it (Stash > View stashes).")
+    body = "\n\n".join(part for part in (notes, res["stat"], res["out"]) if part)
+    _show_text_result("Pull", header, body)
+
+# ---- Push ----
+
+def git_push(on_success=None, success_note=""):
+    r, branch = _current_branch_and_remote()
+    if not r:
+        return
+    rp = repo
+
+    def work():
+        try:
+            tracking = rp.active_branch.tracking_branch()
+        except Exception:
+            tracking = None
+        if tracking is None:
+            # First push of this branch: create it on the remote and track it.
+            return rp.git.push("--set-upstream", r.name, branch), True
+        return rp.git.push(r.name, branch), False
+
+    def done(res, err):
+        if err:
+            text = str(err)
+            if "[rejected]" in text or "non-fast-forward" in text or "fetch first" in text:
+                messagebox.showerror(
+                    "Git Push",
+                    "The remote has commits you don't have yet, so it refused the push.\n\n"
+                    "Click Pull first, then Push again.\n\n"
+                    f"Details:\n{text}")
+            elif "403" in text or "Permission" in text:
+                messagebox.showerror(
+                    "Git Push (auth)",
+                    f"{text}\n\nRemote: {r.name}\nURL: {get_origin_url()}\n\n"
+                    "Fix:\n"
+                    "• If remote is HTTPS, use a Personal Access Token or switch to SSH.\n"
+                    "• If remote is SSH, ensure your key is added and 'ssh -T git@HOST' succeeds.\n"
+                    "Both can be set up in the Git AuthN tab.")
+            else:
+                messagebox.showerror("Git Push", f"Git push failed:\n{text}")
+            return
+        out, new_upstream = res
+        msg = out or f"Pushed '{branch}' to '{r.name}'."
+        if success_note:
+            msg += f"\n{success_note}"
+        if new_upstream:
+            msg += f"\n\n'{branch}' now tracks '{r.name}/{branch}'."
+        if on_success:
+            on_success()
+        messagebox.showinfo("Git Push", msg)
+        refresh_workflow_graph()
+
+    _run_git_op("Pushing", work, done)
 
 # =============== Commit Section ===============
 
@@ -3505,6 +4002,10 @@ def _reset_commit_ui(clear_add_all: bool = False, hide_push: bool = True):
         pass
     try:
         commit_msg_entry.delete(0, "end")
+    except Exception:
+        pass
+    try:
+        commit_desc_text.delete("1.0", "end")
     except Exception:
         pass
     clear_selected_files()
@@ -3797,7 +4298,7 @@ def _pre_commit_sync_if_needed() -> bool:
                 return False
 
             try:
-                repo.git.pull(r.name, branch_name)
+                repo.git.pull(_PULL_STRATEGY, r.name, branch_name)
             except Exception as e:
                 messagebox.showerror("Pull failed", f"Git pull failed:\n{e}")
                 return False
@@ -3814,7 +4315,7 @@ def _pre_commit_sync_if_needed() -> bool:
                     return False
         elif behind > 0 and not dirty:
             try:
-                repo.git.pull(r.name, branch_name)
+                repo.git.pull(_PULL_STRATEGY, r.name, branch_name)
             except Exception as e:
                 messagebox.showerror("Pull failed", f"Git pull failed:\n{e}")
                 return False
@@ -3823,6 +4324,12 @@ def _pre_commit_sync_if_needed() -> bool:
     except Exception as e:
         messagebox.showerror("Sync check failed", f"{e}")
         return False
+
+def _full_commit_message(summary: str) -> str:
+    """Join the summary with the optional description (blank line between),
+    the same layout `git commit -m <summary> -m <description>` produces."""
+    desc = commit_desc_text.get("1.0", "end").strip()
+    return f"{summary}\n\n{desc}" if desc else summary
 
 def commit_changes():
     global repo
@@ -3850,7 +4357,7 @@ def commit_changes():
                 messagebox.showinfo("Nothing to commit", "No changes are staged.")
                 return
 
-            repo.index.commit(msg)
+            repo.index.commit(_full_commit_message(msg))
             committed_files = [(os.path.basename(p), msg) for p in staged]
 
         else:
@@ -3877,7 +4384,7 @@ def commit_changes():
                     continue
 
                 repo.git.add("--", rel_git)
-                repo.index.commit(per_msg)
+                repo.index.commit(_full_commit_message(per_msg))
                 committed_files.append((os.path.basename(f), per_msg))
 
             if not committed_files:
@@ -4175,48 +4682,14 @@ def show_commit_summary(committed_files):
     tk.Button(btns, text="Close", command=popup.destroy).grid(row=0, column=1, sticky="w", padx=5)
 
 def push_changes(popup, committed_files):
-    global repo
-    if not repo:
-        messagebox.showwarning("Error", "No repository loaded.")
-        return
+    """Git Push from the Commit Summary popup: same background push as the
+    Push button; the popup closes once the push succeeds."""
+    def _close_popup():
+        if popup.winfo_exists():
+            popup.destroy()
 
-    r = _get_primary_remote()
-    if not r:
-        messagebox.showerror("Error", "No remote found in this repository.")
-        return
-
-    branch_name = _current_branch_name() or branch_var.get().strip()
-    if not branch_name:
-        messagebox.showerror("Error", "Cannot determine the current branch. Checkout a branch before pushing.")
-        return
-
-    try:
-        tracking = None
-        try:
-            tracking = repo.active_branch.tracking_branch()
-        except Exception:
-            tracking = None
-
-        if tracking is None or str(tracking) == '':
-            repo.git.push('--set-upstream', r.name, branch_name)
-        else:
-            repo.git.push(r.name, branch_name)
-
-        popup.destroy()
-        messagebox.showinfo("Success", f"Pushed {len(committed_files)} file(s) to {r.name}/{branch_name}")
-    except Exception as e:
-        err = str(e)
-        origin = get_origin_url()
-        if "403" in err or "Permission" in err:
-            messagebox.showerror(
-                "Push failed (auth)",
-                f"{err}\n\nRemote: {r.name}\nURL: {origin}\n\n"
-                "Fix:\n"
-                "• If remote is HTTPS, use a Personal Access Token or switch to SSH.\n"
-                "• If remote is SSH, ensure your key is added and 'ssh -T git@HOST' succeeds.\n"
-            )
-        else:
-            messagebox.showerror("Push failed", f"{err}")
+    git_push(on_success=_close_popup,
+             success_note=f"{len(committed_files)} committed file(s) pushed.")
 
 # =============== Workflow Graph helpers (ASCII) ===============
 
@@ -5299,12 +5772,8 @@ branch_section.grid(row=1, column=0, columnspan=3, padx=10, pady=10, sticky="we"
 tk.Label(branch_section, text="Manage your Git branches.", font=("Arial", 10))\
   .grid(row=0, column=0, columnspan=4, sticky="w")
 
-tk.Button(branch_section, text="List Branches", command=list_branches)\
-  .grid(row=1, column=0, padx=5, pady=5)
 tk.Button(branch_section, text="Refresh Branches", command=refresh_branches)\
-  .grid(row=1, column=1, padx=5, pady=5)
-tk.Button(branch_section, text="Git Pull", command=git_pull)\
-  .grid(row=1, column=2, padx=5, pady=5)
+  .grid(row=1, column=0, padx=5, pady=5, sticky="w")
 current_branch_label = tk.Label(branch_section, text="Current branch: N/A")
 current_branch_label.grid(row=2, column=0, sticky="w")
 branch_dropdown = None
@@ -5312,14 +5781,28 @@ branch_dropdown = None
 git_check_section = tk.LabelFrame(branch_section, text="Git Operations on Current Branch",
                                   padx=10, pady=10, relief="ridge", font=("Arial", 10, "bold"))
 git_check_section.grid(row=4, column=0, columnspan=3, pady=10, sticky="we")
-tk.Button(git_check_section, text="Fetch & Status", command=git_fetch_status)\
-  .grid(row=0, column=0, padx=5, pady=5)
-tk.Button(git_check_section, text="View Log", command=git_log_branch)\
-  .grid(row=0, column=1, padx=5, pady=5)
-tk.Button(git_check_section, text="Pull Latest", command=git_pull_branch)\
-  .grid(row=0, column=2, padx=5, pady=5)
-tk.Button(git_check_section, text="Fetch & Prune", command=fetch_all_and_prune)\
-  .grid(row=0, column=3, padx=5, pady=5)
+for _i, (_text, _cmd) in enumerate((
+        ("Status", git_fetch_status),
+        ("View Log", git_log_branch),
+        ("Incoming / Outgoing", git_incoming_outgoing),
+        ("Pull", git_pull_branch),
+        ("Push", git_push))):
+    _b = tk.Button(git_check_section, text=_text, command=_cmd)
+    _b.grid(row=0, column=_i, padx=5, pady=5)
+    _git_op_buttons.append(_b)
+
+stash_button = tk.Menubutton(git_check_section, text="Stash ▾", relief="raised", padx=6, pady=3)
+stash_menu = tk.Menu(stash_button, tearoff=0)
+stash_menu.add_command(label="Stash changes (save aside)", command=git_stash_save)
+stash_menu.add_command(label="Apply latest stash", command=git_stash_pop)
+stash_menu.add_separator()
+stash_menu.add_command(label="View stashes...", command=git_stash_list)
+stash_button.config(menu=stash_menu)
+stash_button.grid(row=0, column=5, padx=5, pady=5)
+_git_op_buttons.append(stash_button)
+
+git_ops_status_label = tk.Label(git_check_section, text="", fg="#555555", font=("Arial", 9, "italic"))
+git_ops_status_label.grid(row=1, column=0, columnspan=6, sticky="w", padx=5)
 
 commit_section = tk.LabelFrame(scrollable_frame, text="Commit Changes",
                                padx=10, pady=10, relief="groove", font=("Arial", 12, "bold"))
@@ -5342,11 +5825,19 @@ commit_msg_label = tk.Label(commit_section, text="Commit message (for all files)
 commit_msg_label.grid(row=2, column=0, sticky="w", padx=5, pady=5)
 commit_msg_entry = tk.Entry(commit_section, width=55)
 commit_msg_entry.grid(row=2, column=1, columnspan=2, padx=5, pady=5)
+
+# Optional description (commit body), shared by every commit made in one go.
+# Git stores it after a blank line below the summary, like GitHub Desktop.
+tk.Label(commit_section, text="Description (optional):")\
+  .grid(row=3, column=0, sticky="nw", padx=5, pady=5)
+commit_desc_text = tk.Text(commit_section, width=55, height=4, wrap="word")
+commit_desc_text.grid(row=3, column=1, columnspan=2, padx=5, pady=5)
+
 tk.Button(commit_section, text="Commit Changes", command=commit_changes)\
-  .grid(row=3, column=0, columnspan=3, pady=10)
+  .grid(row=4, column=0, columnspan=3, pady=10)
 
 preview_row = tk.Frame(commit_section)
-preview_row.grid(row=4, column=0, columnspan=3, pady=(0, 10))
+preview_row.grid(row=5, column=0, columnspan=3, pady=(0, 10))
 tk.Button(preview_row, text="Preview Changes", command=preview_changes)\
   .grid(row=0, column=0, padx=6)
 _refresh_commit_msg_visibility()
@@ -5363,6 +5854,74 @@ tk.Label(
 ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
 tk.Button(push_section, text="Git Push", command=git_push).grid(row=1, column=0, padx=5, pady=5)
+
+# ---- Static "Git Basics" guide, in the empty column to the right of the sections
+guide_section = tk.LabelFrame(scrollable_frame, text="Git Basics - How It Works",
+                              padx=10, pady=10, relief="groove", font=("Arial", 12, "bold"))
+guide_section.grid(row=0, column=3, rowspan=4, padx=10, pady=10, sticky="nw")
+
+_GUIDE_WRAP = 380
+
+tk.Label(guide_section, font=("Courier New", 9), justify="left", fg="#333333",
+         text="Working folder --add--> Staging --commit--> Local repo\n"
+              "Local repo  --push--> Remote (GitLab/GitHub)\n"
+              "Remote      --pull--> Local repo + Working folder\n"
+              "Working folder <--stash / apply--> Stash (saved aside)")\
+  .pack(anchor="w", pady=(0, 10))
+
+_GUIDE_STEPS = [
+    ("1. Clone / Load",
+     "Clone copies a remote repository to your PC (git clone). "
+     "Load opens a folder that is already a repository."),
+    ("2. Choose a branch",
+     "A branch is a separate line of work. Pick it in the dropdown to switch "
+     "(git checkout). Refresh Branches shows local branches at once, then "
+     "fetches new / deleted remote branches in the background."),
+    ("3. Pull first",
+     "Pull merges teammates' commits into your branch (git pull --no-rebase). "
+     "It checks first: says 'Already up to date' if nothing is new, and offers to "
+     "move local files out of the way. Afterwards it shows which files changed."),
+    ("4. Edit your files",
+     "Make your changes in your editor as usual. Git only notices them; "
+     "nothing is saved in history yet."),
+    ("5. Check",
+     "Status lists changed, new (untracked) and deleted files and whether you "
+     "are ahead / behind the remote. View Log shows the latest 500 commits. "
+     "Incoming / Outgoing lists exactly what a Pull would bring in and a Push "
+     "would send."),
+    ("6. Commit",
+     "Pick 'Add all files' or Choose Files (git add), write a short summary "
+     "and optional description, then Commit (git commit). A commit is a "
+     "saved snapshot - but only on your PC."),
+    ("7. Push",
+     "Push uploads your commits to the remote (git push) so others can pull "
+     "them. A brand-new branch is created on the remote automatically. If the "
+     "remote has newer commits, Push is refused - Pull first, then Push again."),
+]
+
+for _title, _body in _GUIDE_STEPS:
+    tk.Label(guide_section, text=_title, font=("Arial", 10, "bold"), justify="left")\
+      .pack(anchor="w")
+    tk.Label(guide_section, text=_body, font=("Arial", 9), justify="left",
+             wraplength=_GUIDE_WRAP).pack(anchor="w", padx=(12, 0), pady=(0, 6))
+
+tk.Label(guide_section, text="Tips", font=("Arial", 10, "bold")).pack(anchor="w", pady=(6, 0))
+for _tip in (
+    "Fetch only checks the remote; Pull also changes your files.",
+    "Never-committed file with the same name as an incoming one (e.g. .gitignore)? "
+    "Pull offers to rename yours to <name>.local-backup - compare, then delete it.",
+    "Uncommitted edits in files the pull changes? Pull offers to stash them, "
+    "pull, and restore them automatically.",
+    "Merge conflict? Fix the <<<<<<< / >>>>>>> parts in the listed files and "
+    "commit, or run 'git merge --abort' in the Terminal tab to cancel.",
+    "Stash ▾ saves unfinished work aside (e.g. before switching branch); "
+    "Apply latest stash brings it back, View stashes lists them all.",
+    "Network actions run in the background - wait for the status line under "
+    "the buttons (e.g. 'Pulling...') to clear.",
+    "Keep the summary short (about 50 chars); put details in the description.",
+):
+    tk.Label(guide_section, text="• " + _tip, font=("Arial", 9), justify="left",
+             wraplength=_GUIDE_WRAP).pack(anchor="w", padx=(12, 0), pady=(0, 4))
 
 # ---- Workflow Graph Tab
 graph_top = tk.Frame(graph_tab)
@@ -5501,7 +6060,7 @@ except Exception:
 
 def smart_pdf_name():
     base = "igrm_User_Guide"
-    ver = "v0.32"
+    ver = "v0.33"
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
     repo_name = ""
     try:
@@ -5539,7 +6098,7 @@ tk.Label(
 tk.Button(about_tab, text="Download User Guide (PDF)", command=download_pdf).pack(pady=10)
 tk.Label(
     about_tab,
-    text="-----------------------------------------\nInsightsNet GitRepo Manager\nVersion 0.32\n© 2026",
+    text="-----------------------------------------\nInsightsNet GitRepo Manager\nVersion 0.33\n© 2026",
     font=("Arial", 12),
     pady=(20)
 ).pack()
