@@ -3860,13 +3860,18 @@ def git_push(on_success=None, success_note=""):
 # =============== Commit Section ===============
 
 def _set_commit_msg_visibility(show: bool):
-    """Show/hide the single commit message row."""
+    """Show/hide the single commit message + description rows (selected files
+    carry their own message and description instead)."""
     if show:
         commit_msg_label.grid(row=2, column=0, sticky="w", padx=5, pady=5)
         commit_msg_entry.grid(row=2, column=1, columnspan=2, padx=5, pady=5)
+        commit_desc_label.grid(row=3, column=0, sticky="nw", padx=5, pady=5)
+        commit_desc_text.grid(row=3, column=1, columnspan=2, padx=5, pady=5)
     else:
         commit_msg_label.grid_remove()
         commit_msg_entry.grid_remove()
+        commit_desc_label.grid_remove()
+        commit_desc_text.grid_remove()
 
 def _refresh_commit_msg_visibility():
     """Hide the 'all files' message if selecting specific files."""
@@ -3928,41 +3933,36 @@ def choose_files():
         _refresh_commit_msg_visibility()
 
 def add_file_entry(f):
+    """One block per selected file: its own commit message and description."""
     global file_entries
-    row_idx = len(file_entries) * 2
+    box = tk.Frame(file_messages_frame)
+    box.pack(fill="x", anchor="w", pady=(0, 10))
 
-    lbl = tk.Label(file_messages_frame, text=os.path.basename(f))
-    lbl.grid(row=row_idx, column=0, sticky="w", padx=10)
+    tk.Label(box, text=os.path.basename(f), font=("Arial", 10, "bold"))\
+      .grid(row=0, column=0, columnspan=2, sticky="w", padx=10)
+    tk.Button(box, text="X", fg="red", command=lambda file=f: remove_file(file))\
+      .grid(row=0, column=2, padx=5)
 
-    entry = tk.Entry(file_messages_frame, width=50)
-    entry.grid(row=row_idx + 1, column=0, padx=10, pady=(0, 10))
+    tk.Label(box, text="Commit message:").grid(row=1, column=0, sticky="w", padx=(10, 5))
+    entry = tk.Entry(box, width=50)
+    entry.grid(row=1, column=1, sticky="w", pady=2)
 
-    btn = tk.Button(file_messages_frame, text="X", fg="red", command=lambda file=f: remove_file(file))
-    btn.grid(row=row_idx, column=1, padx=5)
+    tk.Label(box, text="Description (optional):").grid(row=2, column=0, sticky="nw", padx=(10, 5))
+    desc = tk.Text(box, width=50, height=3, wrap="word")
+    desc.grid(row=2, column=1, sticky="w", pady=2)
 
-    file_entries[f] = (lbl, entry, btn)
+    file_entries[f] = (box, entry, desc)
 
 def remove_file(f):
     global selected_files, file_entries
     if f in selected_files:
         selected_files.remove(f)
-        lbl, entry, btn = file_entries[f]
-        lbl.destroy()
-        entry.destroy()
-        btn.destroy()
+        file_entries[f][0].destroy()
         del file_entries[f]
-        refresh_file_entries()
 
     if not selected_files:
         add_all_checkbox.grid(row=0, column=0, sticky="w", padx=5, pady=(0, 5))
     _refresh_commit_msg_visibility()
-
-def refresh_file_entries():
-    for idx, f in enumerate(list(file_entries.keys())):
-        lbl, entry, btn = file_entries[f]
-        lbl.grid(row=idx * 2, column=0, sticky="w", padx=10)
-        entry.grid(row=idx * 2 + 1, column=0, padx=10, pady=(0, 10))
-        btn.grid(row=idx * 2, column=1, padx=5)
 
 def _show_push_section():
     try:
@@ -4362,10 +4362,11 @@ def _pre_commit_sync_if_needed() -> bool:
         messagebox.showerror("Sync check failed", f"{e}")
         return False
 
-def _full_commit_message(summary: str) -> str:
+def _full_commit_message(summary: str, desc_widget=None) -> str:
     """Join the summary with the optional description (blank line between),
-    the same layout `git commit -m <summary> -m <description>` produces."""
-    desc = commit_desc_text.get("1.0", "end").strip()
+    the same layout `git commit -m <summary> -m <description>` produces.
+    desc_widget defaults to the shared description box."""
+    desc = (desc_widget or commit_desc_text).get("1.0", "end").strip()
     return f"{summary}\n\n{desc}" if desc else summary
 
 def commit_changes():
@@ -4421,7 +4422,7 @@ def commit_changes():
                     continue
 
                 repo.git.add("--", rel_git)
-                repo.index.commit(_full_commit_message(per_msg))
+                repo.index.commit(_full_commit_message(per_msg, file_entries[f][2]))
                 committed_files.append((os.path.basename(f), per_msg))
 
             if not committed_files:
@@ -4835,14 +4836,17 @@ def _collect_workflow_data(r: Repo):
         short_sha = c.hexsha[:8]
         when = datetime.datetime.fromtimestamp(c.committed_date).strftime("%Y-%m-%d")
         author = c.author.name if c.author else "Unknown"
-        msg = c.message.splitlines()[0] if (c.message or "").splitlines() else ""
+        summary, desc = _split_commit_message(c.message)
+        # Table cells are single-line, so flatten the description there
+        desc_flat = " ".join(desc.split())
         branch = _branch_hint_for_commit(r, c.hexsha) or ""
         try:
             changed = list(c.stats.files or {})
         except Exception:
             changed = []
         file_names = ", ".join(os.path.basename(str(p)) for p in changed)
-        commits_rows.append((short_sha, when, author, branch, len(changed), file_names, msg))
+        commits_rows.append((short_sha, when, author, branch, len(changed), file_names,
+                             summary, desc_flat))
 
     # --- Build Merges rows ---
     try:
@@ -4971,6 +4975,14 @@ def refresh_workflow_graph():
     # Backwards-compatible entry point (use async to keep UI responsive)
     refresh_workflow_graph_async()
 
+def _split_commit_message(message: str):
+    """Split a commit message into (summary, description): the first line,
+    then everything after it (Git puts a blank line between the two)."""
+    lines = (message or "").strip().splitlines()
+    if not lines:
+        return "", ""
+    return lines[0].strip(), "\n".join(lines[1:]).strip()
+
 def _commit_file_rows(r: Repo, c):
     """Return (status, path, +lines, -lines) for every file a commit touched.
 
@@ -5012,9 +5024,10 @@ def show_commit_files(_evt=None):
     values = commits_table.item(sel[0], "values")
     if not values:
         return
-    short_sha, msg = values[0], values[-1]
+    short_sha = values[0]
     try:
         c = repo.commit(short_sha)
+        summary, desc = _split_commit_message(c.message)
         rows = _commit_file_rows(repo, c)
     except Exception as e:
         messagebox.showerror("Error", f"Failed to read files for {short_sha}:\n{e}")
@@ -5022,16 +5035,28 @@ def show_commit_files(_evt=None):
 
     popup = Toplevel(root)
     popup.title(f"Files in commit {short_sha}")
-    popup.geometry("760x420")
-    popup.minsize(480, 240)
+    popup.geometry("760x520")
+    popup.minsize(480, 300)
     popup.transient(root)
     popup.grid_rowconfigure(2, weight=1)
     popup.grid_columnconfigure(0, weight=1)
 
     tk.Label(popup, text=f"Commit {short_sha}   ({len(rows)} file(s))",
              font=("Arial", 12, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 2))
-    tk.Label(popup, text=msg, anchor="w", justify="left", wraplength=720)\
-      .grid(row=1, column=0, sticky="w", padx=10, pady=(0, 6))
+
+    info = tk.Frame(popup)
+    info.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+    info.grid_columnconfigure(1, weight=1)
+    tk.Label(info, text="Commit:", font=("Arial", 10, "bold"))\
+      .grid(row=0, column=0, sticky="nw", padx=(0, 6))
+    tk.Label(info, text=summary or "(no summary)", anchor="w", justify="left", wraplength=640)\
+      .grid(row=0, column=1, sticky="w")
+    tk.Label(info, text="Description:", font=("Arial", 10, "bold"))\
+      .grid(row=1, column=0, sticky="nw", padx=(0, 6), pady=(4, 0))
+    desc_box = scrolledtext.ScrolledText(info, wrap="word", height=4, font=("Segoe UI", 9))
+    desc_box.insert("1.0", desc or "(no description)")
+    desc_box.config(state="disabled")
+    desc_box.grid(row=1, column=1, sticky="ew", pady=(4, 0))
 
     table_wrap = tk.Frame(popup)
     table_wrap.grid(row=2, column=0, sticky="nsew", padx=10)
@@ -5863,10 +5888,10 @@ commit_msg_label.grid(row=2, column=0, sticky="w", padx=5, pady=5)
 commit_msg_entry = tk.Entry(commit_section, width=55)
 commit_msg_entry.grid(row=2, column=1, columnspan=2, padx=5, pady=5)
 
-# Optional description (commit body), shared by every commit made in one go.
-# Git stores it after a blank line below the summary, like GitHub Desktop.
-tk.Label(commit_section, text="Description (optional):")\
-  .grid(row=3, column=0, sticky="nw", padx=5, pady=5)
+# Optional description (commit body) for the "all files" commit; selected
+# files each get their own. Git stores it after a blank line below the summary.
+commit_desc_label = tk.Label(commit_section, text="Description (optional):")
+commit_desc_label.grid(row=3, column=0, sticky="nw", padx=5, pady=5)
 commit_desc_text = tk.Text(commit_section, width=55, height=4, wrap="word")
 commit_desc_text.grid(row=3, column=1, columnspan=2, padx=5, pady=5)
 
@@ -6068,9 +6093,9 @@ tk.Label(commits_frame, text="Recent Commits   (double-click a commit to see its
          font=("Arial", 10, "bold"))\
   .grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 6))
 
-commits_cols = ("sha", "date", "author", "branch", "files", "file names", "message")
+commits_cols = ("sha", "date", "author", "branch", "files", "file names", "commit", "description")
 commits_table = ttk.Treeview(commits_frame, columns=commits_cols, show="headings")
-for col, w in zip(commits_cols, (90, 90, 160, 110, 50, 260, 500)):
+for col, w in zip(commits_cols, (90, 90, 160, 110, 50, 260, 300, 400)):
     commits_table.heading(col, text=col.upper())
     commits_table.column(col, width=w, anchor="w")
 
@@ -6097,7 +6122,7 @@ except Exception:
 
 def smart_pdf_name():
     base = "igrm_User_Guide"
-    ver = "v0.33"
+    ver = "v0.35"
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
     repo_name = ""
     try:
@@ -6135,12 +6160,11 @@ tk.Label(
 tk.Button(about_tab, text="Download User Guide (PDF)", command=download_pdf).pack(pady=10)
 tk.Label(
     about_tab,
-    text="-----------------------------------------\nInsightsNet GitRepo Manager\nVersion 0.33\n© 2026",
+    text="-----------------------------------------\nInsightsNet GitRepo Manager\nVersion 0.35\n© 2026",
     font=("Arial", 12),
     pady=(20)
 ).pack()
-_insightsnet_credit(about_tab, size=12, fg="#000").pack()
-_hyperlink(about_tab, INSIGHTSNET_URL, INSIGHTSNET_URL, size=10).pack(pady=(4, 20))
+_insightsnet_credit(about_tab, size=12, fg="#000").pack(pady=(0, 20))
 
 # ---- Git AuthN Tab (UI + remote tools)
 # Scrollable container so the whole tab is reachable without resizing the window.
@@ -6221,3 +6245,20 @@ _update_terminal_prompt()
 _drain_ui_queue()
 
 root.mainloop()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# pyinstaller -y --clean --noupx --onefile --windowed --name="InsightsNetGitRepoManager" --icon=insightsnet_logo_taskbar.ico --add-data "insightsnet_logo_taskbar.ico;." --add-data "insightsnet_logo.png;." --add-data "InsightsNetGitRepoManager_guideline.pdf;." app32.py
